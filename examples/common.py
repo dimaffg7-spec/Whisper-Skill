@@ -48,6 +48,9 @@ def _has_cuda() -> bool:
 
 def _pick_backend() -> str:
     """Выбрать оптимальный установленный бэкенд."""
+    forced = os.environ.get("WHISPER_BACKEND")
+    if forced:
+        return forced
     if _is_apple_silicon() and _has_module("mlx_whisper"):
         return "mlx"
     if _has_module("faster_whisper"):
@@ -147,6 +150,8 @@ def transcribe(
         return _transcribe_whisperx(audio_path, language, model_name, word_timestamps, verbose)
     if backend == "cpp":
         return _transcribe_cpp(audio_path, language, model_name, word_timestamps, verbose)
+    if backend == "openvino":
+        return _transcribe_openvino(audio_path, language, model_name, word_timestamps, verbose)
     raise ValueError(f"unknown backend: {backend}")
 
 
@@ -190,15 +195,22 @@ def _transcribe_faster(audio, lang, model_name, word_ts, verbose):
     if model is None:
         if verbose:
             print(f"[whisper-skill] loading {model_name} on {device}/{compute_type}...")
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        cpu_threads = int(os.environ.get("WHISPER_CPU_THREADS", os.cpu_count() or 4))
+        model = WhisperModel(model_name, device=device, compute_type=compute_type, cpu_threads=cpu_threads)
         _loaded_models[key] = model
 
+    beam_size = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
+    best_of = int(os.environ.get("WHISPER_BEST_OF", "5"))
+    condition_on_prev = os.environ.get("WHISPER_CONDITION_ON_PREV", "1") != "0"
     segments_iter, info = model.transcribe(
         audio,
         language=lang,
         word_timestamps=word_ts,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
+        beam_size=beam_size,
+        best_of=best_of,
+        condition_on_previous_text=condition_on_prev,
     )
     segs: list[Segment] = []
     text_parts: list[str] = []
@@ -261,6 +273,74 @@ def _transcribe_whisperx(audio, lang, model_name, word_ts, verbose):
         language=res.get("language", lang or "?"),
         segments=segs,
         backend="whisperx",
+        model=model_name,
+    )
+
+
+def _transcribe_openvino(audio, lang, model_name, word_ts, verbose):
+    """OpenVINO бэкенд — для Intel CPU/iGPU/NPU.
+
+    Модель ищется в ~/.cache/openvino-whisper/whisper-{model_name}-ov/.
+    Конвертацию делает scripts/convert_openvino.py (запускается один раз).
+
+    Контролируется env vars:
+        WHISPER_OV_DEVICE  — GPU (default), NPU, CPU, AUTO
+        WHISPER_OV_DIR     — переопределение пути к локальным IR-моделям
+    """
+    import soundfile as sf
+    import numpy as np
+    from optimum.intel import OVModelForSpeechSeq2Seq
+    from transformers import AutoProcessor
+
+    device = os.environ.get("WHISPER_OV_DEVICE", "GPU")
+    base_dir = Path(os.environ.get(
+        "WHISPER_OV_DIR",
+        Path.home() / ".cache" / "openvino-whisper",
+    ))
+    model_dir = base_dir / f"whisper-{model_name}-ov"
+
+    if not model_dir.exists():
+        raise RuntimeError(
+            f"OpenVINO IR модель не найдена: {model_dir}\n"
+            f"Сконвертируй: python scripts/convert_openvino.py {model_name}"
+        )
+
+    key = ("openvino", str(model_dir), device)
+    cached = _loaded_models.get(key)
+    if cached is None:
+        if verbose:
+            print(f"[whisper-skill] loading OpenVINO model on {device}...")
+        processor = AutoProcessor.from_pretrained(str(model_dir))
+        model = OVModelForSpeechSeq2Seq.from_pretrained(
+            str(model_dir), device=device, compile=True
+        )
+        cached = (model, processor)
+        _loaded_models[key] = cached
+    model, processor = cached
+
+    audio_arr, sr = sf.read(audio, dtype="float32")
+    if audio_arr.ndim > 1:
+        audio_arr = audio_arr.mean(axis=1)
+    if sr != 16000:
+        import scipy.signal as sps
+        audio_arr = sps.resample_poly(audio_arr, 16000, sr).astype("float32")
+
+    inputs = processor(audio_arr, sampling_rate=16000, return_tensors="pt")
+    max_new = int(os.environ.get("WHISPER_OV_MAX_NEW_TOKENS", "440"))
+    gen = model.generate(
+        inputs.input_features,
+        language=lang,
+        task="transcribe",
+        max_new_tokens=max_new,
+    )
+    text = processor.batch_decode(gen, skip_special_tokens=True)[0].strip()
+
+    seg = Segment(start=0.0, end=float(len(audio_arr) / 16000), text=text)
+    return Result(
+        text=text,
+        language=lang or "?",
+        segments=[seg],
+        backend="openvino",
         model=model_name,
     )
 
