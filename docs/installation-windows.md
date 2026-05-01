@@ -101,6 +101,33 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 audio.wav
 whisper-cli -m ggml-large-v3-turbo.bin -l ru -f audio.wav --output-srt
 ```
 
+## Опция 4 — OpenVINO для Intel Core Ultra / Intel Arc
+
+Если у тебя процессор Intel Core Ultra (Meteor Lake / Lunar Lake / Arrow Lake) или дискретная Arc — это **самый быстрый путь без NVIDIA**. OpenVINO задействует **iGPU + NPU + CPU одновременно**.
+
+```powershell
+# В уже созданном venv:
+pip install openvino openvino-tokenizers "optimum-intel[openvino]" onnx
+
+# Проверь что OpenVINO видит iGPU + NPU:
+python -c "import openvino as ov; [print(d) for d in ov.Core().available_devices]"
+# Ожидается: CPU, GPU, NPU
+```
+
+Если NPU/GPU не появились — обнови [Intel Graphics Driver](https://www.intel.com/content/www/us/en/download-center/home.html) (нужна версия 32.0.x или новее, релизы 2024+).
+
+```powershell
+# Сконвертируй модель в OpenVINO IR (~2-3 мин, один раз):
+python scripts\convert_openvino.py large-v3-turbo
+
+# Использовать через unified интерфейс:
+$env:WHISPER_BACKEND = "openvino"
+$env:WHISPER_OV_DEVICE = "GPU"   # Intel Arc iGPU. Также: NPU, CPU, AUTO
+python -m examples.transcribe_one input.mp3 --language ru --model large-v3-turbo
+```
+
+Подробнее, бенчмарки и грабли: [backends/openvino.md](../backends/openvino.md).
+
 ## Типичные грабли на Windows
 
 ### `error: Microsoft Visual C++ 14.0 or greater is required`

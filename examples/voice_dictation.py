@@ -50,6 +50,8 @@ DEFAULT_CONFIG = {
     "mode": "ptt",                       # "ptt" (push-to-talk) или "toggle"
     "language": None,                    # null = auto. Лучше указать ("ru", "en")
     "model": "large-v3-turbo",
+    "backend": None,                     # "openvino" | "faster" | "mlx" | "cpp" | null = auto
+    "ov_device": "GPU",                  # OpenVINO: GPU | NPU | CPU | AUTO
     "sample_rate": 16000,
     "channels": 1,
     "max_duration_sec": 60,
@@ -174,15 +176,55 @@ def copy_to_clipboard(text: str) -> None:
         logging.error(f"clipboard copy failed: {e}")
 
 
+def _windows_paste() -> None:
+    """Надёжная симуляция Ctrl+V на Windows через Win32 SendInput.
+
+    Принудительно отпускает все возможные "залипшие" модификаторы
+    (после хоткея типа Ctrl+Alt пользователь может ещё их удерживать),
+    затем выполняет чистый Ctrl+V.
+    """
+    import ctypes
+    import time as _t
+    user32 = ctypes.windll.user32
+
+    KEYEVENTF_KEYUP = 0x0002
+    VK = {
+        "ctrl": 0x11, "lctrl": 0xA2, "rctrl": 0xA3,
+        "alt": 0x12, "lalt": 0xA4, "ralt": 0xA5,
+        "shift": 0x10, "lshift": 0xA0, "rshift": 0xA1,
+        "lwin": 0x5B, "rwin": 0x5C,
+        "v": 0x56,
+    }
+    # 1) Release any held modifiers (idempotent — release of unpressed key is no-op)
+    for name in ("lctrl", "rctrl", "ctrl", "lalt", "ralt", "alt",
+                 "lshift", "rshift", "shift", "lwin", "rwin"):
+        user32.keybd_event(VK[name], 0, KEYEVENTF_KEYUP, 0)
+    _t.sleep(0.03)
+    # 2) Clean Ctrl+V
+    user32.keybd_event(VK["ctrl"], 0, 0, 0)
+    user32.keybd_event(VK["v"], 0, 0, 0)
+    _t.sleep(0.02)
+    user32.keybd_event(VK["v"], 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK["ctrl"], 0, KEYEVENTF_KEYUP, 0)
+
+
 def paste_from_clipboard() -> None:
     """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win)."""
     try:
-        from pynput.keyboard import Controller, Key
-        kb = Controller()
-        modifier = Key.cmd if platform.system() == "Darwin" else Key.ctrl
-        with kb.pressed(modifier):
-            kb.press("v")
-            kb.release("v")
+        if platform.system() == "Windows":
+            _windows_paste()
+        elif platform.system() == "Darwin":
+            from pynput.keyboard import Controller, Key
+            kb = Controller()
+            with kb.pressed(Key.cmd):
+                kb.press("v")
+                kb.release("v")
+        else:
+            from pynput.keyboard import Controller, Key
+            kb = Controller()
+            with kb.pressed(Key.ctrl):
+                kb.press("v")
+                kb.release("v")
     except Exception as e:
         logging.error(f"paste simulation failed: {e}")
 
@@ -337,7 +379,7 @@ def main_loop(cfg: dict):
                     print(f"✓ ({elapsed:.1f}s) → {text}")
                     copy_to_clipboard(text)
                     if cfg.get("auto_paste"):
-                        time.sleep(0.05)  # дать целевому полю стать активным
+                        time.sleep(0.25)  # дать целевому полю стать активным
                         paste_from_clipboard()
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
@@ -444,6 +486,19 @@ def main():
     if args.setup:
         setup_wizard()
         return 0
+
+    # Fast mode for dictation: greedy decoding, no temperature fallback
+    os.environ.setdefault("WHISPER_BEAM_SIZE", "1")
+    os.environ.setdefault("WHISPER_BEST_OF", "1")
+    os.environ.setdefault("WHISPER_CONDITION_ON_PREV", "0")
+
+    # Apply backend selection from config (must happen before transcribe is imported)
+    cfg_path_for_env = Path(args.config) if args.config else default_config_path()
+    cfg_for_env = load_config(cfg_path_for_env)
+    if cfg_for_env.get("backend"):
+        os.environ["WHISPER_BACKEND"] = cfg_for_env["backend"]
+    if cfg_for_env.get("ov_device"):
+        os.environ["WHISPER_OV_DEVICE"] = cfg_for_env["ov_device"]
 
     cfg_path = Path(args.config) if args.config else default_config_path()
     cfg = load_config(cfg_path)

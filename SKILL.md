@@ -1,6 +1,6 @@
 ---
 name: whisper-skill
-description: Используй этот скилл когда пользователю нужна локальная транскрибация аудио/видео через Whisper, голосовой ввод (диктовка вместо клавиатуры, push-to-talk hotkey), или вшивание субтитров в MP4 в стиле CapCut. Активируй при задачах "транскрибируй файл/папку/TikTok/YouTube/подкаст", "сабы для shorts/reels/тиктока", "speech-to-text локально", "speaker diarization", "диктовка голосом", "Superwhisper alternative", "Wispr Flow alternative", "voice dictation". Скилл автоматически определяет ОС/CPU/GPU и подбирает оптимальный бэкенд (faster-whisper / whisper.cpp / whisperx / mlx-whisper) и модель под железо пользователя. Включает interactive wizard (wizard.py) который ставит всё одной командой. Все языки, бесплатно после установки, никаких API.
+description: Используй этот скилл когда пользователю нужна локальная транскрибация аудио/видео через Whisper, голосовой ввод (диктовка вместо клавиатуры, push-to-talk hotkey), или вшивание субтитров в MP4 в стиле CapCut. Активируй при задачах "транскрибируй файл/папку/TikTok/YouTube/подкаст", "сабы для shorts/reels/тиктока", "speech-to-text локально", "speaker diarization", "диктовка голосом", "Superwhisper alternative", "Wispr Flow alternative", "voice dictation". Скилл автоматически определяет ОС/CPU/GPU и подбирает оптимальный бэкенд (faster-whisper / whisper.cpp / whisperx / mlx-whisper / openvino) и модель под железо пользователя. Для Intel Core Ultra / Intel Arc — openvino задействует iGPU+NPU. Включает interactive wizard (wizard.py) который ставит всё одной командой. Все языки, бесплатно после установки, никаких API.
 ---
 
 # Whisper Skill — локальная транскрибация без OpenAI API
@@ -51,7 +51,8 @@ python scripts/detect_env.py
 | Mac M1/M2/M3/M4 | **mlx-whisper** (нативный Metal) | [backends/mlx-whisper.md](backends/mlx-whisper.md) |
 | Linux + NVIDIA GPU | **faster-whisper** (CUDA) | [backends/faster-whisper.md](backends/faster-whisper.md) |
 | Windows + NVIDIA GPU | **faster-whisper** через WSL2 | [backends/faster-whisper.md](backends/faster-whisper.md) |
-| Любая ОС, нет GPU, не Mac | **whisper.cpp** (CPU-оптимизированный) | [backends/whisper-cpp.md](backends/whisper-cpp.md) |
+| Intel Core Ultra (Meteor Lake+) / Intel Arc | **openvino** (нативный iGPU + NPU) | [backends/openvino.md](backends/openvino.md) |
+| Любая ОС, нет GPU, не Mac, не Intel Ultra | **whisper.cpp** (CPU-оптимизированный) | [backends/whisper-cpp.md](backends/whisper-cpp.md) |
 | Нужны спикеры (diarization) | **whisperx** (faster-whisper + pyannote) | [backends/whisperx.md](backends/whisperx.md) |
 
 ### Шаг 3 — выбери модель под задачу
@@ -155,6 +156,7 @@ Diarization = «кто-что-сказал». Для подкастов / инт
 | [backends/whisper-cpp.md](backends/whisper-cpp.md) | Без Python / минимум зависимостей |
 | [backends/whisperx.md](backends/whisperx.md) | Нужна diarization или word-timestamps |
 | [backends/mlx-whisper.md](backends/mlx-whisper.md) | Mac M1+ |
+| [backends/openvino.md](backends/openvino.md) | Intel Core Ultra / Intel Arc — задействует iGPU + NPU |
 | [models/README.md](models/README.md) | Выбор модели под задачу |
 | [docs/installation-mac.md](docs/installation-mac.md) | Установка под Mac |
 | [docs/installation-linux.md](docs/installation-linux.md) | Установка под Linux |

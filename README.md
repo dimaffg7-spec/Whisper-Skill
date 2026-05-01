@@ -190,6 +190,7 @@ python wizard.py
 |---|---|---|---|
 | **mlx-whisper** | Mac M1/M2/M3/M4/M5 — нативный Metal | до 18x realtime | [backends/mlx-whisper.md](backends/mlx-whisper.md) |
 | **faster-whisper** | Linux/Windows + NVIDIA GPU; универсальный CPU | до 17x realtime | [backends/faster-whisper.md](backends/faster-whisper.md) |
+| **openvino** | Intel Core Ultra / Intel Arc — нативный iGPU + NPU | ~10x realtime на iGPU | [backends/openvino.md](backends/openvino.md) |
 | **whisper.cpp** | Один бинарник без Python; edge-устройства; AMD GPU через Vulkan | 7-15x realtime | [backends/whisper-cpp.md](backends/whisper-cpp.md) |
 | **whisperx** | Speaker diarization (подкасты) или word-level alignment | ~7 мин на 1 час подкаста | [backends/whisperx.md](backends/whisperx.md) |
 
