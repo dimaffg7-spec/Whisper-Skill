@@ -1,9 +1,14 @@
 """
 Тонкий indicator у курсора мыши.
 
-Маленькая точка, которая следует за системным курсором с лёгким смещением
-(~14px вниз-вправо) и пульсирует. Показывается только пока идёт запись —
-видно "идёт ли запись" не отрываясь от поля ввода.
+Два режима:
+- "recording" — маленькая мигающая красная точка (caret-style blink).
+- "transcribing" — вращающаяся янтарная катушка-бобина (как у старой
+  кинокамеры): диск с тремя окошками на радиусе и центральной осью.
+
+Используется так: пока пользователь держит PTT-хоткей, индикатор в
+recording-режиме. Отпустил — переключаемся в transcribing, и показываем
+бобину до тех пор, пока распознанный текст не вставился в активное поле.
 
 Tk запускается в собственном daemon-thread'е (Tk не любит вызовы из чужих
 потоков). Внешний код шлёт команды через queue.Queue, GUI вычитывает их
@@ -15,11 +20,13 @@ Windows-only нюанс: позиция курсора берётся через
 Использование:
     from scripts.cursor_indicator import CursorIndicator
 
-    ind = CursorIndicator(color="#ef4444")
+    ind = CursorIndicator()
     ind.start()
     # ... начали запись ...
-    ind.show()
-    # ... закончили ...
+    ind.show()                  # recording — мигающая точка
+    # ... отпустили хоткей, идёт транскрибация и вставка ...
+    ind.show_transcribing()     # transcribing — крутится катушка
+    # ... текст вставлен ...
     ind.hide()
     # ... выход ...
     ind.stop()
@@ -36,14 +43,27 @@ import time
 from typing import Optional, Tuple
 
 
-SIZE = 6                     # window size (square)
-DOT_RADIUS = 1.5             # tiny solid red dot
-OFFSET_X = 10                # cursor → dot offset (right of cursor)
-OFFSET_Y = 6                 # ~middle of arrow cursor height
-TRANSPARENT_BG = "#ff00ff"   # transparent-key colour (magenta) on Windows
-DEFAULT_COLOR = "#ef4444"    # red-500
-BLINK_PERIOD_S = 0.6         # one full on/off cycle (caret-style blink)
-TICK_MS = 33                 # ~30 fps
+# Окно одинакового размера в обоих режимах — позиция относительно курсора
+# не "прыгает" при переключении точка↔катушка.
+WIN_SIZE = 20
+CENTER_OFFSET_X = 13           # где центр окна относительно курсора (X)
+CENTER_OFFSET_Y = 10           # где центр окна относительно курсора (Y)
+WIN_OFFSET_X = CENTER_OFFSET_X - WIN_SIZE // 2
+WIN_OFFSET_Y = CENTER_OFFSET_Y - WIN_SIZE // 2
+
+DOT_RADIUS = 1.5               # recording — крошечная точка
+REEL_OUTER_R = 6.075           # transcribing — внешний радиус катушки
+REEL_HOLE_R = 1.134            # окошки на катушке
+REEL_HOLES_DIST = 3.726        # радиус, на котором сидят окошки
+REEL_AXIS_R = 1.134            # центральная ось (отверстие посередине)
+REEL_PERIOD_S = 0.8            # один полный оборот катушки
+
+TRANSPARENT_BG = "#ff00ff"     # transparent-key colour (magenta) on Windows
+DEFAULT_DOT_COLOR = "#ef4444"  # red-500 — recording
+DEFAULT_REEL_COLOR = "#f4a261" # amber — transcribing (совпадает с цветом
+                               # transcribing-state в tray icon)
+BLINK_PERIOD_S = 0.6           # один цикл on/off для точки
+TICK_MS = 33                   # ~30 fps
 POLL_MS = 15
 
 
@@ -83,8 +103,13 @@ def _get_cursor_pos() -> Optional[Tuple[int, int]]:
 
 
 class CursorIndicator:
-    def __init__(self, color: str = DEFAULT_COLOR):
+    def __init__(
+        self,
+        color: str = DEFAULT_DOT_COLOR,
+        reel_color: str = DEFAULT_REEL_COLOR,
+    ):
         self.color = color
+        self.reel_color = reel_color
         self._cmd_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
         self._ready = threading.Event()
         self._stopped = threading.Event()
@@ -101,10 +126,15 @@ class CursorIndicator:
         self._stopped.wait(timeout=1.0)
 
     def show(self) -> None:
-        self._cmd_queue.put(("show", None))
+        """Recording mode — blinking red dot."""
+        self._cmd_queue.put(("mode", "recording"))
+
+    def show_transcribing(self) -> None:
+        """Transcribing mode — spinning amber film reel."""
+        self._cmd_queue.put(("mode", "transcribing"))
 
     def hide(self) -> None:
-        self._cmd_queue.put(("hide", None))
+        self._cmd_queue.put(("mode", "hidden"))
 
     # ─── Internals (Tk thread only) ─────────────────────────────────────
 
@@ -138,17 +168,17 @@ class CursorIndicator:
             self._win.wm_attributes("-disabled", True)
         except Exception:
             pass
-        self._win.geometry(f"{SIZE}x{SIZE}+0+0")
+        self._win.geometry(f"{WIN_SIZE}x{WIN_SIZE}+0+0")
         self._win.withdraw()
 
         self._canvas = tk.Canvas(
-            self._win, width=SIZE, height=SIZE,
+            self._win, width=WIN_SIZE, height=WIN_SIZE,
             bg=TRANSPARENT_BG, highlightthickness=0, bd=0,
         )
         self._canvas.pack()
 
         self._is_visible = False
-        self._target_visible = False
+        self._target_mode = "hidden"   # "hidden" | "recording" | "transcribing"
         self._anim_phase = 0.0
 
         self._tk.after(POLL_MS, self._poll_commands)
@@ -166,14 +196,12 @@ class CursorIndicator:
     def _poll_commands(self) -> None:
         try:
             while True:
-                cmd, _ = self._cmd_queue.get_nowait()
+                cmd, arg = self._cmd_queue.get_nowait()
                 if cmd == "__quit__":
                     self._tk.quit()
                     return
-                elif cmd == "show":
-                    self._target_visible = True
-                elif cmd == "hide":
-                    self._target_visible = False
+                elif cmd == "mode":
+                    self._target_mode = arg  # type: ignore[assignment]
         except queue.Empty:
             pass
         try:
@@ -182,11 +210,13 @@ class CursorIndicator:
             pass
 
     def _tick(self) -> None:
-        # Toggle visibility per command
-        if self._target_visible and not self._is_visible:
+        should_be_visible = self._target_mode != "hidden"
+
+        # Toggle visibility per current target mode
+        if should_be_visible and not self._is_visible:
             self._win.deiconify()
             self._is_visible = True
-        elif not self._target_visible and self._is_visible:
+        elif not should_be_visible and self._is_visible:
             self._win.withdraw()
             self._is_visible = False
 
@@ -197,17 +227,21 @@ class CursorIndicator:
             pos = _get_cursor_pos()
             if pos is not None:
                 cx, cy = pos
-                self._win.geometry(f"{SIZE}x{SIZE}+{cx + OFFSET_X}+{cy + OFFSET_Y}")
+                self._win.geometry(
+                    f"{WIN_SIZE}x{WIN_SIZE}+{cx + WIN_OFFSET_X}+{cy + WIN_OFFSET_Y}"
+                )
 
-            # Pulse the dot radius
-            self._draw()
+            if self._target_mode == "recording":
+                self._draw_dot()
+            elif self._target_mode == "transcribing":
+                self._draw_reel()
 
         try:
             self._tk.after(TICK_MS, self._tick)
         except Exception:
             pass
 
-    def _draw(self) -> None:
+    def _draw_dot(self) -> None:
         c = self._canvas
         c.delete("all")
 
@@ -218,10 +252,46 @@ class CursorIndicator:
         if phase >= 0.5:
             return  # off — leave canvas empty (transparent)
 
-        cx = SIZE / 2
-        cy = SIZE / 2
+        cx = WIN_SIZE / 2
+        cy = WIN_SIZE / 2
         r = DOT_RADIUS
         c.create_oval(
             cx - r, cy - r, cx + r, cy + r,
             fill=self.color, outline="",
+        )
+
+    def _draw_reel(self) -> None:
+        """Янтарный диск с тремя вращающимися окошками-отверстиями + ось."""
+        c = self._canvas
+        c.delete("all")
+
+        cx = WIN_SIZE / 2
+        cy = WIN_SIZE / 2
+        angle = (self._anim_phase % REEL_PERIOD_S) / REEL_PERIOD_S * 2.0 * math.pi
+
+        # Solid amber disk
+        c.create_oval(
+            cx - REEL_OUTER_R, cy - REEL_OUTER_R,
+            cx + REEL_OUTER_R, cy + REEL_OUTER_R,
+            fill=self.reel_color, outline="",
+        )
+
+        # Three "windows" on the reel — filled with the transparent-key color
+        # so on Windows you literally see through them. They rotate together,
+        # which makes the spin readable even at this tiny size.
+        for i in range(3):
+            a = angle + i * (2.0 * math.pi / 3.0)
+            hx = cx + REEL_HOLES_DIST * math.cos(a)
+            hy = cy + REEL_HOLES_DIST * math.sin(a)
+            c.create_oval(
+                hx - REEL_HOLE_R, hy - REEL_HOLE_R,
+                hx + REEL_HOLE_R, hy + REEL_HOLE_R,
+                fill=TRANSPARENT_BG, outline="",
+            )
+
+        # Central axis hole
+        c.create_oval(
+            cx - REEL_AXIS_R, cy - REEL_AXIS_R,
+            cx + REEL_AXIS_R, cy + REEL_AXIS_R,
+            fill=TRANSPARENT_BG, outline="",
         )

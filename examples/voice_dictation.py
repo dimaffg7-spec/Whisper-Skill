@@ -458,8 +458,11 @@ def main_loop(cfg: dict):
                 return
             state.is_recording = False
         tray.set_state("transcribing")
+        # Точка → катушка ровно в той же позиции возле курсора. Скрываем
+        # индикатор только когда текст уже вставлен (в work() finally) или
+        # на ранних выходах ниже.
         if cursor_ind:
-            cursor_ind.hide()
+            cursor_ind.show_transcribing()
 
         # Сначала закрываем микрофон, потом играем бип. Параллельный запуск
         # winsound во время stream.close() PortAudio даёт повторное звучание
@@ -469,6 +472,8 @@ def main_loop(cfg: dict):
             threading.Thread(target=play_stop_beep, daemon=True).start()
         if not wav_path:
             tray.set_state("idle")
+            if cursor_ind:
+                cursor_ind.hide()
             return
         duration_ms = recorder.duration_sec * 1000
 
@@ -477,6 +482,8 @@ def main_loop(cfg: dict):
             try: os.unlink(wav_path)
             except: pass
             tray.set_state("idle")
+            if cursor_ind:
+                cursor_ind.hide()
             return
 
         print(f"⏳ Transcribing {duration_ms:.0f}ms of audio...")
@@ -508,6 +515,8 @@ def main_loop(cfg: dict):
             finally:
                 state.is_transcribing = False
                 tray.set_state("idle")
+                if cursor_ind:
+                    cursor_ind.hide()
                 try: os.unlink(wav_path)
                 except: pass
 
