@@ -277,11 +277,89 @@ def _transcribe_whisperx(audio, lang, model_name, word_ts, verbose):
     )
 
 
+_OV_WHISPER_WINDOW_S = 30.0     # архитектурный лимит Whisper
+_OV_PACK_WINDOW_S = 28.0        # окно для упаковки VAD-сегментов (margin от 30s)
+_OV_SEGMENT_PAD_S = 0.1
+_OV_VAD_WARNED = False
+
+
+def _ov_load_vad():
+    """Опциональный silero-vad для long-form. None если не установлен."""
+    try:
+        from silero_vad import load_silero_vad
+        return load_silero_vad()
+    except Exception:
+        return None
+
+
+def _ov_vad_segments(audio, vad_model, sr=16000):
+    """silero-vad → [(start_s, end_s), ...]."""
+    import torch
+    from silero_vad import get_speech_timestamps
+    audio_t = torch.from_numpy(audio).float()
+    ts = get_speech_timestamps(
+        audio_t, vad_model,
+        threshold=0.5,
+        min_speech_duration_ms=250,
+        min_silence_duration_ms=500,
+        sampling_rate=sr,
+        return_seconds=True,
+    )
+    return [(t["start"], t["end"]) for t in ts]
+
+
+def _ov_pack_windows(segments, total_s, window_s=_OV_PACK_WINDOW_S):
+    """Greedy-упаковка VAD-сегментов в окна ≤ window_s.
+    Сегменты длиннее window_s режутся насильно (фраза без пауз)."""
+    if not segments:
+        return []
+    windows: list[tuple[float, float]] = []
+    win_start, win_end = None, None
+    for seg_start, seg_end in segments:
+        if seg_end - seg_start > window_s:
+            if win_start is not None:
+                windows.append((win_start, win_end))
+                win_start, win_end = None, None
+            cur = seg_start
+            while cur < seg_end:
+                cut = min(cur + window_s, seg_end)
+                windows.append((cur, cut))
+                cur = cut
+            continue
+        if win_start is None:
+            win_start, win_end = seg_start, seg_end
+        elif seg_end - win_start <= window_s:
+            win_end = seg_end
+        else:
+            windows.append((win_start, win_end))
+            win_start, win_end = seg_start, seg_end
+    if win_start is not None:
+        windows.append((win_start, win_end))
+    # Расширяем края на _OV_SEGMENT_PAD_S чтобы не отрезать слова
+    return [(max(0.0, s - _OV_SEGMENT_PAD_S),
+             min(total_s, e + _OV_SEGMENT_PAD_S)) for s, e in windows]
+
+
+def _ov_decode_window(audio_chunk, model, processor, lang, max_new):
+    inputs = processor(audio_chunk, sampling_rate=16000, return_tensors="pt")
+    gen = model.generate(
+        inputs.input_features,
+        language=lang,
+        task="transcribe",
+        max_new_tokens=max_new,
+    )
+    return processor.batch_decode(gen, skip_special_tokens=True)[0].strip()
+
+
 def _transcribe_openvino(audio, lang, model_name, word_ts, verbose):
     """OpenVINO бэкенд — для Intel CPU/iGPU/NPU.
 
     Модель ищется в ~/.cache/openvino-whisper/whisper-{model_name}-ov/.
     Конвертацию делает scripts/convert_openvino.py (запускается один раз).
+
+    Long-form (>30s): если установлен silero-vad — режем по паузам и
+    декодируем окна по 28s по очереди. Без silero-vad — single pass
+    (Whisper обрежет до первых 30s; печатается warning).
 
     Контролируется env vars:
         WHISPER_OV_DEVICE  — GPU (default), NPU, CPU, AUTO
@@ -325,17 +403,48 @@ def _transcribe_openvino(audio, lang, model_name, word_ts, verbose):
         import scipy.signal as sps
         audio_arr = sps.resample_poly(audio_arr, 16000, sr).astype("float32")
 
-    inputs = processor(audio_arr, sampling_rate=16000, return_tensors="pt")
+    total_s = len(audio_arr) / 16000.0
     max_new = int(os.environ.get("WHISPER_OV_MAX_NEW_TOKENS", "440"))
-    gen = model.generate(
-        inputs.input_features,
-        language=lang,
-        task="transcribe",
-        max_new_tokens=max_new,
-    )
-    text = processor.batch_decode(gen, skip_special_tokens=True)[0].strip()
 
-    seg = Segment(start=0.0, end=float(len(audio_arr) / 16000), text=text)
+    # Long-form path: audio > 30s + silero-vad доступен
+    vad_model = None
+    if total_s > _OV_WHISPER_WINDOW_S:
+        vad_model = _ov_load_vad()
+        global _OV_VAD_WARNED
+        if vad_model is None and not _OV_VAD_WARNED:
+            print(
+                f"[whisper-skill] WARNING: audio is {total_s:.0f}s but silero-vad "
+                "is not installed. Whisper will only transcribe the first 30s. "
+                "Install: pip install silero-vad",
+                file=sys.stderr,
+            )
+            _OV_VAD_WARNED = True
+
+    if vad_model is not None and total_s > _OV_WHISPER_WINDOW_S:
+        segments = _ov_vad_segments(audio_arr, vad_model)
+        windows = _ov_pack_windows(segments, total_s)
+        if not windows:
+            return Result(text="", language=lang or "?", segments=[],
+                          backend="openvino", model=model_name)
+        segs: list[Segment] = []
+        text_parts: list[str] = []
+        for w_start, w_end in windows:
+            chunk = audio_arr[int(w_start * 16000):int(w_end * 16000)]
+            t = _ov_decode_window(chunk, model, processor, lang, max_new)
+            if t:
+                segs.append(Segment(start=w_start, end=w_end, text=t))
+                text_parts.append(t)
+        return Result(
+            text=" ".join(text_parts).strip(),
+            language=lang or "?",
+            segments=segs,
+            backend="openvino",
+            model=model_name,
+        )
+
+    # Single-pass path: ≤30s или нет silero-vad
+    text = _ov_decode_window(audio_arr, model, processor, lang, max_new)
+    seg = Segment(start=0.0, end=float(total_s), text=text)
     return Result(
         text=text,
         language=lang or "?",

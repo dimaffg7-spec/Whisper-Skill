@@ -32,7 +32,12 @@ source .venv/bin/activate
 
 pip install --upgrade openvino openvino-tokenizers \
             "optimum-intel[openvino]" onnx
+
+# Опционально — для long-form (audio > 30s):
+pip install silero-vad
 ```
+
+Без `silero-vad` бэкенд работает, но `model.generate()` за один прогон видит только первые 30 секунд аудио (архитектурный лимит Whisper). С `silero-vad` аудио режется по паузам и каждый сегмент декодируется отдельно — как в faster-whisper / mlx-whisper.
 
 ### Windows: проверь драйвер Intel Arc/iGPU
 
