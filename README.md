@@ -273,6 +273,32 @@ python -m examples.voice_dictation --config my_dictation.json
 
 Кастомизация через JSON — хоткей (любая комбинация `pynput`-формата), модель, режим `ptt` / `toggle`, auto-paste, бипы для feedback'а. Полные опции: [docs/voice-dictation.md](docs/voice-dictation.md).
 
+#### Установка как Windows-приложение (autostart, иконка, ярлык)
+
+Чтобы не запускать каждый раз руками из терминала:
+
+```powershell
+# 1) Сгенерить .ico из assets/icon.png (один раз)
+python -m scripts.build_icon
+
+# 2) Ярлык в меню «Пуск» (опционально + на рабочем столе)
+powershell -ExecutionPolicy Bypass -File .\tools\install_shortcut.ps1
+powershell -ExecutionPolicy Bypass -File .\tools\install_shortcut.ps1 -Desktop
+
+# 3) Автостарт при логине пользователя
+powershell -ExecutionPolicy Bypass -File .\tools\install_autostart.ps1
+
+# Снять автостарт / удалить ярлык:
+powershell -ExecutionPolicy Bypass -File .\tools\uninstall_autostart.ps1
+powershell -ExecutionPolicy Bypass -File .\tools\install_shortcut.ps1 -Remove
+```
+
+Под капотом — `launcher\voice_dictation_silent.vbs`, который тихо
+стартует `pythonw.exe` из venv (без окна терминала). Скрипт ожидает
+venv по `~\.venvs\whisper`; если у тебя другое расположение — поправь
+путь в .vbs. Состояние диктовки видно по tray-иконке: серая = idle,
+красная точка = идёт запись, оранжевая = транскрибируем.
+
 ### Сабы прямо в MP4
 
 ```bash
