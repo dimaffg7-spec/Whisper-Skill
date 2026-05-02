@@ -176,7 +176,125 @@ class AudioRecorder:
 # ─── Text insertion ─────────────────────────────────────────────────────────
 
 
+def _windows_set_clipboard_text(text: str) -> bool:
+    """Надёжная запись CF_UNICODETEXT через Win32. Возвращает True при успехе.
+
+    pyperclip на Windows периодически не выдерживает rapid-fire вызовы и
+    может отвалиться без исключения. Эта реализация делает retry на
+    OpenClipboard (буфер мог быть занят другим процессом) и явно владеет
+    памятью до момента, когда система её забирает.
+    """
+    import ctypes
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.EmptyClipboard.restype = ctypes.c_int
+    user32.CloseClipboard.restype = ctypes.c_int
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+
+    GMEM_MOVEABLE = 0x0002
+    CF_UNICODETEXT = 13
+
+    data = text.encode("utf-16-le") + b"\x00\x00"
+    h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not h_mem:
+        return False
+    p_mem = kernel32.GlobalLock(h_mem)
+    if not p_mem:
+        kernel32.GlobalFree(h_mem)
+        return False
+    ctypes.memmove(p_mem, data, len(data))
+    kernel32.GlobalUnlock(h_mem)
+
+    opened = False
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.01)
+    if not opened:
+        kernel32.GlobalFree(h_mem)
+        return False
+
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(CF_UNICODETEXT, h_mem):
+            kernel32.GlobalFree(h_mem)
+            return False
+        return True
+    finally:
+        user32.CloseClipboard()
+
+
+def _windows_get_clipboard_text() -> Optional[str]:
+    """Чтение CF_UNICODETEXT через Win32. None если буфер пуст / не текст /
+    OpenClipboard не удался."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.CloseClipboard.restype = ctypes.c_int
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+
+    CF_UNICODETEXT = 13
+
+    opened = False
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.01)
+    if not opened:
+        return None
+
+    try:
+        h = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return None
+        p = kernel32.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            return ctypes.wstring_at(p)
+        finally:
+            kernel32.GlobalUnlock(h)
+    finally:
+        user32.CloseClipboard()
+
+
+def _get_clipboard_text() -> Optional[str]:
+    if platform.system() == "Windows":
+        return _windows_get_clipboard_text()
+    try:
+        import pyperclip
+        return pyperclip.paste() or None
+    except Exception:
+        return None
+
+
 def copy_to_clipboard(text: str) -> None:
+    if platform.system() == "Windows":
+        if _windows_set_clipboard_text(text):
+            return
+        logging.warning("win32 clipboard set failed, falling back to pyperclip")
     try:
         import pyperclip
         pyperclip.copy(text)
@@ -185,28 +303,59 @@ def copy_to_clipboard(text: str) -> None:
 
 
 def save_clipboard() -> Optional[str]:
-    """Прочитать текущее текстовое содержимое буфера для последующего восстановления.
+    """Снимок текстового содержимого буфера для последующего восстановления.
 
-    Возвращает None если буфер пуст / содержит не-текст / pyperclip не доступен —
-    в этих случаях мы не пытаемся восстанавливать (всё равно не сохранили).
+    None если буфер пуст / содержит не-текст (картинку, файл) / не удалось
+    прочитать. В этих случаях restore тоже no-op — мы не пытаемся
+    восстановить то, что не сохранили.
     """
-    try:
-        import pyperclip
-        cur = pyperclip.paste()
-        return cur if cur else None
-    except Exception:
-        return None
+    text = _get_clipboard_text()
+    if text is None:
+        logging.info("clipboard save: empty or non-text, restore will be skipped")
+    return text
 
 
 def restore_clipboard(saved: Optional[str]) -> None:
-    """Положить старое содержимое буфера обратно. No-op если saved is None."""
-    if saved is None:
+    """Положить сохранённое содержимое обратно с verify-and-retry.
+
+    После записи читаем буфер и сравниваем; если не совпало — повторяем
+    до 3 попыток. Защита от того, что в момент нашей записи буфер был
+    занят другим процессом (Win+V history listener, clipboard manager).
+    """
+    if not saved:
         return
-    try:
-        import pyperclip
-        pyperclip.copy(saved)
-    except Exception as e:
-        logging.error(f"clipboard restore failed: {e}")
+    for attempt in range(3):
+        copy_to_clipboard(saved)
+        current = _get_clipboard_text()
+        if current == saved:
+            return
+        time.sleep(0.05)
+    logging.warning(
+        f"clipboard restore not verified after 3 attempts "
+        f"(expected len={len(saved)}, got len={len(current) if current else 0})"
+    )
+
+
+def restore_clipboard_deferred(saved: Optional[str], delay_sec: float = 1.0) -> None:
+    """Восстановить буфер с задержкой в отдельном потоке.
+
+    SendInput возвращается синхронно, но таргет-приложение обрабатывает
+    Ctrl+V асинхронно: сначала помещает WM_PASTE в очередь, обработчик
+    читает буфер в свою очередь. На медленных таргетах (Chrome,
+    Electron, web-приложения вроде ChatGPT/Claude) между нашим SendInput
+    и реальным чтением буфера может пройти 200–800 мс. Если восстановить
+    буфер слишком быстро — приложение прочитает уже восстановленный
+    оригинал, а не диктованный текст. delay_sec=1.0 покрывает медленные
+    таргеты с запасом.
+    """
+    if not saved:
+        return
+
+    def _do():
+        time.sleep(delay_sec)
+        restore_clipboard(saved)
+
+    threading.Thread(target=_do, daemon=True).start()
 
 
 def _windows_paste() -> None:
@@ -688,15 +837,16 @@ def main_loop(cfg: dict):
                     print("⏭  Empty transcription")
                 else:
                     print(f"✓ ({elapsed:.1f}s) → {text}")
-                    saved_clipboard = save_clipboard()
+                    saved_clipboard = save_clipboard() if cfg.get("auto_paste") else None
                     copy_to_clipboard(text)
                     if cfg.get("auto_paste"):
                         time.sleep(0.25)  # дать целевому полю стать активным
                         paste_from_clipboard()
-                        # Восстанавливаем содержимое буфера после того как
-                        # целевое поле успело захватить вставку.
-                        time.sleep(0.5)
-                        restore_clipboard(saved_clipboard)
+                        # Восстанавливаем буфер асинхронно через 1с —
+                        # таргет должен успеть обработать WM_PASTE и
+                        # прочитать диктованный текст до того, как мы
+                        # вернём оригинал.
+                        restore_clipboard_deferred(saved_clipboard, delay_sec=1.0)
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
             finally:
