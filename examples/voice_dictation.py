@@ -184,6 +184,31 @@ def copy_to_clipboard(text: str) -> None:
         logging.error(f"clipboard copy failed: {e}")
 
 
+def save_clipboard() -> Optional[str]:
+    """Прочитать текущее текстовое содержимое буфера для последующего восстановления.
+
+    Возвращает None если буфер пуст / содержит не-текст / pyperclip не доступен —
+    в этих случаях мы не пытаемся восстанавливать (всё равно не сохранили).
+    """
+    try:
+        import pyperclip
+        cur = pyperclip.paste()
+        return cur if cur else None
+    except Exception:
+        return None
+
+
+def restore_clipboard(saved: Optional[str]) -> None:
+    """Положить старое содержимое буфера обратно. No-op если saved is None."""
+    if saved is None:
+        return
+    try:
+        import pyperclip
+        pyperclip.copy(saved)
+    except Exception as e:
+        logging.error(f"clipboard restore failed: {e}")
+
+
 def _windows_paste() -> None:
     """Надёжная симуляция Ctrl+V на Windows через Win32 SendInput.
 
@@ -590,10 +615,15 @@ def main_loop(cfg: dict):
                     print("⏭  Empty transcription")
                 else:
                     print(f"✓ ({elapsed:.1f}s) → {text}")
+                    saved_clipboard = save_clipboard()
                     copy_to_clipboard(text)
                     if cfg.get("auto_paste"):
                         time.sleep(0.25)  # дать целевому полю стать активным
                         paste_from_clipboard()
+                        # Восстанавливаем содержимое буфера после того как
+                        # целевое поле успело захватить вставку.
+                        time.sleep(0.5)
+                        restore_clipboard(saved_clipboard)
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
             finally:
