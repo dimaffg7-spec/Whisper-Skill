@@ -594,12 +594,29 @@ def main_loop(cfg: dict):
 
     # Прогрев модели в фоне: первый hotkey-press не должен ждать
     # компиляцию OpenVINO-графа / загрузку весов faster-whisper.
+    # Event сигнализирует завершение warmup'а — work() ждёт его перед
+    # первым transcribe. Это решает две проблемы одним механизмом:
+    #   1) Cold start первой диктовки: без ожидания первый hotkey ловил
+    #      холодную модель + компиляцию OV-графа (5–30с задержка).
+    #   2) Race на module import: warmup-thread и work-thread параллельно
+    #      делают `from optimum.intel import OVModelForSpeechSeq2Seq`.
+    #      transformers._LazyModule под Python 3.12 даёт partially-initialized
+    #      module второму thread'у → AttributeError → Python преобразует в
+    #      ImportError на первой диктовке.
+    warmup_done = threading.Event()
     if cfg.get("warmup", True):
-        threading.Thread(
-            target=_warmup,
-            args=(transcribe, cfg, tray),
-            daemon=True,
-        ).start()
+        def _warmup_then_signal():
+            try:
+                _warmup(transcribe, cfg, tray)
+            finally:
+                # set даже на failure — иначе work() заблокируется навсегда.
+                # Если warmup упал, первый transcribe сам потерпит cold start
+                # — это лучше чем deadlock.
+                warmup_done.set()
+
+        threading.Thread(target=_warmup_then_signal, daemon=True).start()
+    else:
+        warmup_done.set()
 
     # Cursor indicator (small blinking dot near the mouse cursor while recording).
     # Optional — silently disables if Tk unavailable. На macOS всегда no-op
@@ -673,6 +690,9 @@ def main_loop(cfg: dict):
 
         def work():
             try:
+                if not warmup_done.is_set():
+                    print("⏳ Waiting for model warmup to finish...")
+                    warmup_done.wait()
                 t0 = time.time()
                 result = transcribe(
                     wav_path,
