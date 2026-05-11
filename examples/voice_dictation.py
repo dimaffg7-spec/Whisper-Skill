@@ -848,6 +848,7 @@ def _warmup(transcribe_fn, cfg: dict, tray) -> None:
 class State:
     is_recording: bool = False
     is_transcribing: bool = False
+    last_dictation_at: float = 0.0  # time.time() последней успешной вставки
 
 
 def main_loop(cfg: dict, cfg_path: Path):
@@ -1018,8 +1019,18 @@ def main_loop(cfg: dict, cfg_path: Path):
                     print("⏭  Empty transcription")
                 else:
                     print(f"✓ ({elapsed:.1f}s) → {text}")
+                    # Если предыдущая диктовка была недавно — начинаем
+                    # новую с переноса строки. Порог 30s — «продолжаем
+                    # в то же место»; после большой паузы вставка чистая.
+                    newline_threshold_s = cfg.get("newline_after_dictation_within_sec", 30.0)
+                    now = time.time()
+                    if state.last_dictation_at and (now - state.last_dictation_at) < newline_threshold_s:
+                        text_to_paste = "\n" + text
+                    else:
+                        text_to_paste = text
+
                     saved_clipboard = save_clipboard() if cfg.get("auto_paste") else None
-                    copy_to_clipboard(text)
+                    copy_to_clipboard(text_to_paste)
                     if cfg.get("auto_paste"):
                         time.sleep(0.25)  # дать целевому полю стать активным
                         paste_from_clipboard()
@@ -1028,6 +1039,7 @@ def main_loop(cfg: dict, cfg_path: Path):
                         # прочитать диктованный текст до того, как мы
                         # вернём оригинал.
                         restore_clipboard_deferred(saved_clipboard, delay_sec=1.0)
+                    state.last_dictation_at = now
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
             finally:
