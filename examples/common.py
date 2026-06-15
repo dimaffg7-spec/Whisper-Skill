@@ -121,6 +121,8 @@ def transcribe(
     word_timestamps: bool = True,
     backend: Optional[str] = None,
     verbose: bool = False,
+    initial_prompt: Optional[str] = None,
+    condition_on_previous_text: Optional[bool] = None,
 ) -> Result:
     """
     Один файл → транскрибат. Универсально для всех бэкендов.
@@ -131,6 +133,14 @@ def transcribe(
     word_timestamps — пословные метки (для CapCut-стиля сабов)
     backend        — "mlx" | "faster" | "whisperx" | "cpp" | None (auto)
     verbose        — печать прогресса
+    initial_prompt — строка-контекст для bias'а модели (имена, бренды,
+                     термины). Whisper-нативный механизм, лимит ~244 токенов.
+                     Сейчас проброшен только в mlx и faster — для остальных
+                     бэкендов игнорируется (None-safe).
+    condition_on_previous_text — None = дефолт бэкенда. False гасит whisper
+                     repetition-loops (модель не кондишенится на свой повтор) —
+                     для коротких диктовок ставится False. Long-form (сабы,
+                     подкасты) оставляют None (контекст между сегментами полезен).
     """
     audio_path = str(Path(audio_path).resolve())
     if not Path(audio_path).exists():
@@ -143,9 +153,9 @@ def transcribe(
         print(f"[whisper-skill] backend={backend} model={model_name} device={_pick_device()}")
 
     if backend == "mlx":
-        return _transcribe_mlx(audio_path, language, model_name, word_timestamps, verbose)
+        return _transcribe_mlx(audio_path, language, model_name, word_timestamps, verbose, initial_prompt, condition_on_previous_text)
     if backend == "faster":
-        return _transcribe_faster(audio_path, language, model_name, word_timestamps, verbose)
+        return _transcribe_faster(audio_path, language, model_name, word_timestamps, verbose, initial_prompt, condition_on_previous_text)
     if backend == "whisperx":
         return _transcribe_whisperx(audio_path, language, model_name, word_timestamps, verbose)
     if backend == "cpp":
@@ -155,20 +165,24 @@ def transcribe(
     raise ValueError(f"unknown backend: {backend}")
 
 
-def _transcribe_mlx(audio, lang, model_name, word_ts, verbose):
+def _transcribe_mlx(audio, lang, model_name, word_ts, verbose, initial_prompt=None, condition_on_previous_text=None):
     import mlx_whisper
 
     repo = (
         model_name if "/" in model_name
         else f"mlx-community/whisper-{model_name}"
     )
-    res = mlx_whisper.transcribe(
-        audio,
+    kwargs = dict(
         path_or_hf_repo=repo,
         language=lang,
         word_timestamps=word_ts,
         verbose=verbose,
     )
+    if initial_prompt:
+        kwargs["initial_prompt"] = initial_prompt
+    if condition_on_previous_text is not None:
+        kwargs["condition_on_previous_text"] = condition_on_previous_text
+    res = mlx_whisper.transcribe(audio, **kwargs)
     segs = [
         Segment(
             start=s["start"], end=s["end"], text=s["text"],
@@ -185,7 +199,7 @@ def _transcribe_mlx(audio, lang, model_name, word_ts, verbose):
     )
 
 
-def _transcribe_faster(audio, lang, model_name, word_ts, verbose):
+def _transcribe_faster(audio, lang, model_name, word_ts, verbose, initial_prompt=None, condition_on_previous_text=None):
     from faster_whisper import WhisperModel
 
     device = _pick_device() if _has_cuda() else "cpu"
@@ -202,8 +216,9 @@ def _transcribe_faster(audio, lang, model_name, word_ts, verbose):
     beam_size = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
     best_of = int(os.environ.get("WHISPER_BEST_OF", "5"))
     condition_on_prev = os.environ.get("WHISPER_CONDITION_ON_PREV", "1") != "0"
-    segments_iter, info = model.transcribe(
-        audio,
+    if condition_on_previous_text is not None:
+        condition_on_prev = condition_on_previous_text
+    faster_kwargs = dict(
         language=lang,
         word_timestamps=word_ts,
         vad_filter=True,
@@ -212,6 +227,9 @@ def _transcribe_faster(audio, lang, model_name, word_ts, verbose):
         best_of=best_of,
         condition_on_previous_text=condition_on_prev,
     )
+    if initial_prompt:
+        faster_kwargs["initial_prompt"] = initial_prompt
+    segments_iter, info = model.transcribe(audio, **faster_kwargs)
     segs: list[Segment] = []
     text_parts: list[str] = []
     for s in segments_iter:

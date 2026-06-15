@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -62,13 +63,115 @@ DEFAULT_CONFIG = {
     "log_file": None,                    # путь к файлу лога или null = stdout
     "trim_silence_ms": 200,              # обрезать тишину в начале/конце записи
     "min_duration_ms": 300,              # игнорировать слишком короткие записи (промахи кнопкой)
+    # Словарь специфичных слов/имён для модели. НЕ user dictionary как в Dragon —
+    # это whisper initial_prompt: модель видит контекст «эти слова ожидаемы» и
+    # с большей вероятностью распознаёт их правильно (особенно имена, бренды,
+    # англицизмы при русской дорожке). Лимит ~244 токенов суммарно.
+    "vocabulary": [],
+    # Post-process find/replace для случаев когда vocabulary-bias не сработал
+    # (whisper стабильно выдаёт неправильный вариант). Применяется к итоговому
+    # тексту до auto_paste. Match: case-insensitive, word-boundary (\b...\b) —
+    # т.е. "cancel" не зацепит "cancellation". Output: ровно как в значении
+    # (без сохранения case оригинала — поведение предсказуемо).
+    "replacements": {},
+    # То же, что replacements, но ключ — это RAW regex (НЕ экранируется).
+    # Для случаев когда whisper коверкает слово множеством способов и literal-
+    # замена не масштабируется (напр. бренд «YouGile» → VGL/ViewGile/UGL/UGile).
+    # Один паттерн ловит всё семейство. Match case-insensitive, замена literal
+    # (через lambda, без backref'ов). Битый regex логируется и пропускается.
+    # ⚠️ Держи паттерн заякоренным (\b...\b), иначе зацепишь живой текст.
+    "replacements_regex": {},
+    # Whisper-галлюцинации: на тишине/хвостах записи модель дописывает «титры»
+    # из ютуб-обучающих данных («Субтитры сделал DimaTorzok», «Редактор
+    # субтитров…»). Эти regex-паттерны (case-insensitive) вырезаются из
+    # итогового текста до auto_paste. Битый паттерн пропускается — не роняет
+    # диктовку. Держи паттерны узкими: только то, что ты НИКОГДА не диктуешь сам,
+    # иначе срежешь живой текст (напр. «Спасибо за просмотр» — рискованно).
+    "hallucination_patterns": [],
     # macOS-специфика: pystray/Tk известно жрут CPU в фоне на macOS
     # (NSRunLoop в non-main thread + Tk thread-safety). Этот флаг автоматически
     # отключает show_tray и show_cursor_indicator на macOS, оставляя CLI-вывод
     # как единственный feedback. Если хочешь tray на Mac на свой страх и риск —
     # поставь false (тогда show_tray/show_cursor_indicator будут уважаться).
     "mac_low_cpu_mode": True,
+    # Whisper repetition-loops: модель иногда залипает и гонит один токен/фразу
+    # десятки-сотни раз («Greek Greek Greek…»). Профилактика — ниже
+    # (condition_on_previous_text), а это страховка-постобработка. Два порога:
+    #  • collapse: повтор подряд >= этого числа — мягко схлопнуть в 1 вхождение
+    #    (для лёгких повторов/заиканий «я-я-я думаю» → «я думаю», остальной
+    #    текст реальный). 4 — выше естественной речи («да-да-да»=3).
+    "repetition_loop_threshold": 4,
+    #  • discard: если непрерывный повтор занял >= этого числа СЛОВ = пато-петля
+    #    whisper = ВСЯ диктовка галлюцинация (Дмитрий этих слов не говорил) → не
+    #    вставлять НИЧЕГО. Метрика в СЛОВАХ (а не в «повторах»), чтобы одинаково
+    #    ловить и однословные («Greek ×180»=180 слов), и фразовые («спасибо за
+    #    внимание ×5»=15 слов) петли. 10 ловит любые реальные петли, но щадит
+    #    живые повторы. 0 = выключить выбрасывание (только collapse).
+    "repetition_loop_discard_threshold": 10,
+    # False гасит repetition-loops на корню (модель не кондишенится на свой
+    # повтор). Для коротких диктовок контекст от прошлого сегмента не нужен.
+    "condition_on_previous_text": False,
 }
+
+
+def _collapse_repetition_loops(text: str, threshold: int = 4):
+    """Схлопывает whisper repetition-loops И сообщает масштаб петли.
+
+    Возвращает (cleaned_text, max_run_words):
+      • max_run_words — макс. длина В СЛОВАХ непрерывного повтора n-граммы
+        (n≤4) в ИСХОДНОМ тексте (= reps*n). Индикатор пато-петли: вызывающий
+        по нему решает, отбросить ли всю диктовку. В словах (а не в повторах),
+        чтобы однословные и фразовые петли мерились одной линейкой.
+      • cleaned_text — n-граммы, повторённые >= threshold раз подряд, ужаты
+        до одного вхождения. Трогаем только соседние повторы.
+    Кейс: «… Greek ×180» → max_run_words=180, текст «… Greek»."""
+    try:
+        threshold = int(threshold)
+    except (TypeError, ValueError):
+        threshold = 4
+    tokens = text.split()
+    if len(tokens) <= 1:
+        return text, 1
+
+    # 1) измеряем макс. длину соседнего повтора В СЛОВАХ (reps*n), n=1..4,
+    #    ДО схлопывания
+    max_run = 1
+    for n in range(1, 5):
+        i, L = 0, len(tokens)
+        while i + n <= L:
+            gram = [t.lower() for t in tokens[i:i + n]]
+            reps, j = 1, i + n
+            while j + n <= L and [t.lower() for t in tokens[j:j + n]] == gram:
+                reps += 1
+                j += n
+            if reps >= 2:
+                max_run = max(max_run, reps * n)
+            i = j if reps > 1 else i + 1
+
+    # 2) мягко схлопываем (для лёгких повторов; пато-петлю вызывающий отбросит)
+    if threshold >= 2 and len(tokens) > threshold:
+        for n in range(4, 0, -1):
+            out: list[str] = []
+            i, L = 0, len(tokens)
+            while i < L:
+                gram = tokens[i:i + n]
+                if len(gram) < n:
+                    out.extend(tokens[i:])
+                    break
+                gram_lower = [t.lower() for t in gram]
+                reps, j = 1, i + n
+                while j + n <= L and [t.lower() for t in tokens[j:j + n]] == gram_lower:
+                    reps += 1
+                    j += n
+                if reps >= threshold:
+                    out.extend(gram)   # оставляем одно вхождение n-граммы
+                    i = j
+                else:
+                    out.append(tokens[i])
+                    i += 1
+            tokens = out
+
+    return " ".join(tokens), max_run
 
 
 def default_config_path() -> Path:
@@ -81,6 +184,10 @@ def load_config(path: Optional[Path] = None) -> dict:
     if not path.exists():
         return dict(DEFAULT_CONFIG)
     user_cfg = json.loads(path.read_text(encoding="utf-8"))
+    # Defense-in-depth: конфиг может содержать кастомные пути / hotkey-настройки,
+    # чужим юзерам это видеть незачем. Идемпотентно — `chmod 600` каждый старт.
+    try: os.chmod(path, 0o600)
+    except OSError: pass
     cfg = dict(DEFAULT_CONFIG)
     cfg.update(user_cfg)
     return cfg
@@ -89,6 +196,8 @@ def load_config(path: Optional[Path] = None) -> dict:
 def write_config(path: Path, cfg: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    try: os.chmod(path, 0o600)
+    except OSError: pass
 
 
 # ─── Available models (OpenVINO cache) ──────────────────────────────────────
@@ -510,38 +619,62 @@ def _windows_paste() -> None:
 def paste_from_clipboard() -> None:
     """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win).
 
-    На macOS приоритет — osascript: он работает через System Events, для которого
-    разрешение Accessibility даётся один раз на Terminal/iTerm, и срабатывает
-    надёжно. pynput-путь оставлен как fallback (на случай отсутствия osascript
-    или сломанного System Events).
+    На macOS Sequoia (26.x) osascript часто молча проглатывает keystroke
+    без ошибки (Python нет в Automation → System Events, attribution от
+    родителя VSCode не всегда передаётся). Поэтому на маке предпочитаем
+    pynput через Quartz CGEventPost — он управляется через Accessibility
+    которая выдаётся напрямую python-бинарю.
 
     На Linux/Windows используется pynput напрямую.
     """
-    # macOS: предпочитаем osascript (надёжнее с защитой Accessibility)
+    # macOS: prefer Quartz CGEventPost (низкий уровень, обходит pynput-цепочку).
+    # pynput-путь press Cmd → press V → release V → release Cmd на Sequoia
+    # иногда не реализуется как «настоящее» Cmd+V для target-app (проверено
+    # 2026-05-23 на M5 macOS 26.5). Quartz одним event'ом с command-flag — ок.
     if platform.system() == "Darwin":
         try:
+            from Quartz import (
+                CGEventCreateKeyboardEvent, CGEventSetFlags,
+                CGEventPost, kCGEventFlagMaskCommand, kCGSessionEventTap,
+            )
+            # kCGSessionEventTap (а не HID) — событие НЕ видно taps на HID-уровне
+            # (= потенциальные сторонние кейлоггеры/мониторы). Целевые приложения
+            # всё равно получают Cmd+V нормально (они taps на session уровне).
+            V_KEYCODE = 9  # virtual key 'v' (US layout)
+            down = CGEventCreateKeyboardEvent(None, V_KEYCODE, True)
+            CGEventSetFlags(down, kCGEventFlagMaskCommand)
+            CGEventPost(kCGSessionEventTap, down)
+            up = CGEventCreateKeyboardEvent(None, V_KEYCODE, False)
+            CGEventSetFlags(up, kCGEventFlagMaskCommand)
+            CGEventPost(kCGSessionEventTap, up)
+            return
+        except Exception as e:
+            logging.warning(f"Quartz paste failed: {e}, trying AppleScript fallback")
+        try:
+            ascript = (
+                'tell application "System Events"\n'
+                '    set frontApp to first application process whose frontmost is true\n'
+                '    set appName to name of frontApp\n'
+                '    tell process appName\n'
+                '        keystroke "v" using command down\n'
+                '    end tell\n'
+                'end tell'
+            )
             subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to keystroke "v" using command down'],
+                ["osascript", "-e", ascript],
                 check=True, capture_output=True, timeout=2,
             )
             return
-        except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or b"").decode(errors="replace")
-            logging.warning(f"osascript paste failed ({stderr.strip()}), trying pynput fallback")
         except Exception as e:
-            logging.warning(f"osascript paste failed: {e}, trying pynput fallback")
+            logging.error(
+                f"AppleScript paste also failed: {e}; "
+                f"текст в clipboard, вставь вручную через Cmd+V."
+            )
+        return
 
-    # Fallback и основной путь для Linux/Windows
     try:
         if platform.system() == "Windows":
             _windows_paste()
-        elif platform.system() == "Darwin":
-            from pynput.keyboard import Controller, Key
-            kb = Controller()
-            with kb.pressed(Key.cmd):
-                kb.press("v")
-                kb.release("v")
         else:
             from pynput.keyboard import Controller, Key
             kb = Controller()
@@ -551,7 +684,7 @@ def paste_from_clipboard() -> None:
     except Exception as e:
         logging.error(
             f"paste simulation failed: {e}\n"
-            f"Текст в clipboard — вставь вручную через Cmd+V/Ctrl+V."
+            f"Текст в clipboard — вставь вручную через Ctrl+V."
         )
 
 
@@ -682,12 +815,38 @@ def _play_wav_bytes(wav: bytes) -> None:
             logging.error(f"winsound play failed: {e}")
 
 
+_MAC_SOUND_START = "/System/Library/Sounds/Tink.aiff"
+_MAC_SOUND_STOP = "/System/Library/Sounds/Pop.aiff"
+_MAC_SOUND_VOLUME = "0.05"  # 0.0-1.0, очень тихо
+
+
+def _mac_afplay(path: str) -> None:
+    try:
+        proc = subprocess.Popen(
+            ["afplay", "-v", _MAC_SOUND_VOLUME, path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+        )
+        # Reaper-thread ждёт ~100ms пока afplay отыграет и заберёт exit-код.
+        # Иначе под KeepAlive=true (launchd, недели работы) копились бы зомби —
+        # 2 на каждую диктовку, к концу месяца сотни. proc.wait() в фоне
+        # позволяет ОС освободить запись в process table сразу после выхода.
+        threading.Thread(target=proc.wait, daemon=True).start()
+    except Exception:
+        pass
+
+
 def play_start_beep() -> None:
+    if platform.system() == "Darwin":
+        _mac_afplay(_MAC_SOUND_START)
+        return
     if _BEEP_WAV_START is not None:
         _play_wav_bytes(_BEEP_WAV_START)
 
 
 def play_stop_beep() -> None:
+    if platform.system() == "Darwin":
+        _mac_afplay(_MAC_SOUND_STOP)
+        return
     if _BEEP_WAV_STOP is not None:
         _play_wav_bytes(_BEEP_WAV_STOP)
 
@@ -821,7 +980,16 @@ def _warmup(transcribe_fn, cfg: dict, tray) -> None:
         # 0.5 сек тишины 16k mono int16 — минимум, который не отлетает по VAD
         sample_rate = 16000
         silence = b"\x00\x00" * (sample_rate // 2)
-        tmp = Path(tempfile.gettempdir()) / "whisper_skill_warmup.wav"
+        # NamedTemporaryFile — unpredictable name + mode 0600 + user-private
+        # /var/folders/.../T/. Раньше был /tmp/whisper_skill_warmup.wav —
+        # предсказуемый путь, потенциальный symlink-attack vector на
+        # многопользовательских системах (single-user mac — низкий риск,
+        # но defense-in-depth).
+        _tmpfd = tempfile.NamedTemporaryFile(
+            prefix="whisper_warmup_", suffix=".wav", delete=False
+        )
+        _tmpfd.close()
+        tmp = Path(_tmpfd.name)
         with wave.open(str(tmp), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
@@ -829,15 +997,21 @@ def _warmup(transcribe_fn, cfg: dict, tray) -> None:
             wf.writeframes(silence)
 
         t0 = time.time()
-        transcribe_fn(
-            str(tmp),
-            language=cfg.get("language"),
-            model_name=cfg.get("model"),
-            backend=cfg.get("backend"),
-            word_timestamps=False,
-            verbose=False,
-        )
-        logging.info(f"warmup done in {time.time() - t0:.1f}s")
+        try:
+            transcribe_fn(
+                str(tmp),
+                language=cfg.get("language"),
+                model_name=cfg.get("model"),
+                backend=cfg.get("backend"),
+                word_timestamps=False,
+                verbose=False,
+            )
+            logging.info(f"warmup done in {time.time() - t0:.1f}s")
+        finally:
+            # Чистим warmup-файл независимо от исхода — иначе тишинный wav
+            # копится в /var/folders/.../T/ при каждом запуске.
+            try: tmp.unlink()
+            except: pass
     except Exception as e:
         # Прогрев — best-effort. Если упал, обычная диктовка продолжит работать
         # как раньше: просто первый запрос будет холодным.
@@ -849,6 +1023,24 @@ class State:
     is_recording: bool = False
     is_transcribing: bool = False
     last_dictation_at: float = 0.0  # time.time() последней успешной вставки
+    record_started_at: float = 0.0  # time.time() начала текущей записи (для watchdog)
+
+
+# Maximum duration of a single PTT recording. After this, watchdog force-stops
+# (releases the lost-release-event deadlock — pynput on macOS occasionally
+# drops on_release events, leaving is_recording=True forever).
+_MAX_RECORDING_SECONDS = 90.0
+_WATCHDOG_TICK_SECONDS = 3.0
+_TAP_REVIVAL_TICK_SECONDS = 0.5
+# Если CGEventTapEnable(True) подряд N раз не оживляет tap (каждый следующий
+# тик IsEnabled опять False) — reference stale, re-enable бесполезен. Тогда
+# self-exit; launchd по KeepAlive=true поднимет новый процесс с новым tap'ом.
+# 8 × 0.5s = 4 секунды агонии до авто-рестарта (было 20 = 10с).
+# Снижено 2026-06-15 на основе 3 недель логов: из 32 серий, перешагнувших
+# #5 revival, 29 (91%) всё равно доходили до zombie и рестартовали — ожидание
+# полных 10с почти всегда бессмысленно. Порог 8 > типичного мерцания #1-5
+# (оно лечится revival без рестарта), но вдвое+ сокращает мёртвую зону хоткея.
+_TAP_STALE_RESTART_THRESHOLD = 8
 
 
 def main_loop(cfg: dict, cfg_path: Path):
@@ -947,6 +1139,7 @@ def main_loop(cfg: dict, cfg_path: Path):
             if state.is_recording or state.is_transcribing:
                 return
             state.is_recording = True
+            state.record_started_at = time.time()
         tray.set_state("recording")
         if cursor_ind:
             cursor_ind.show()
@@ -1005,20 +1198,112 @@ def main_loop(cfg: dict, cfg_path: Path):
                     print("⏳ Waiting for model warmup to finish...")
                     warmup_done.wait()
                 t0 = time.time()
+                vocab_raw = cfg.get("vocabulary") or []
+                # Defense: vocabulary должен быть list[str]. Защита от опечаток
+                # (строка вместо массива, числа внутри списка и т.п.).
+                if isinstance(vocab_raw, list):
+                    vocab = [w for w in vocab_raw if isinstance(w, str) and w.strip()]
+                else:
+                    vocab = []
+                # Soft warning ОДИН раз на процесс при риске упереться в
+                # whisper-лимит ~244 токенов. Грубая эвристика: средне 2 токена
+                # на слово + наша обёртка → safe-зона ~100 слов.
+                if vocab and len(vocab) > 100 and not getattr(state, "_vocab_warned", False):
+                    logging.warning(
+                        f"vocabulary has {len(vocab)} entries — рискуем упереться "
+                        f"в whisper initial_prompt limit (~244 tokens)"
+                    )
+                    state._vocab_warned = True
+                initial_prompt = (
+                    "В разговоре могут упоминаться: " + ", ".join(vocab) + "."
+                    if vocab else None
+                )
                 result = transcribe(
                     wav_path,
                     language=cfg.get("language"),
                     model_name=cfg.get("model"),
                     word_timestamps=False,
                     verbose=False,
+                    initial_prompt=initial_prompt,
+                    # гасим whisper repetition-loops («Greek Greek Greek…»):
+                    # для коротких диктовок контекст от прошлого сегмента не нужен
+                    condition_on_previous_text=cfg.get("condition_on_previous_text", False),
                 )
                 text = result.text.strip()
+                # Страховка от repetition-loops (даже с condition_on_previous_text
+                # =False иногда проскакивает). Меряем масштаб петли и чистим:
+                text, loop_run = _collapse_repetition_loops(
+                    text, threshold=cfg.get("repetition_loop_threshold", 4)
+                )
+                # Патологическая петля = ВСЯ диктовка галлюцинация (этих слов
+                # пользователь не говорил) → не вставляем ничего, пусть переговорит.
+                discard_at = cfg.get("repetition_loop_discard_threshold", 10)
+                if discard_at and loop_run >= discard_at:
+                    logging.warning(
+                        f"repetition loop ({loop_run} слов повтора) — диктовка отброшена целиком как галлюцинация"
+                    )
+                    print(f"⏭  Repetition loop ({loop_run} слов) — галлюцинация, ничего не вставляю")
+                    text = ""
+                replacements = cfg.get("replacements") or {}
+                if isinstance(replacements, dict):
+                    for src, dst in replacements.items():
+                        if not src or not isinstance(src, str) or not isinstance(dst, str):
+                            continue
+                        # lambda для dst — иначе re.sub интерпретирует backref'ы
+                        # (\1, \g<name>) в значении замены. Lambda даёт literal-replacement.
+                        text = re.sub(
+                            rf"\b{re.escape(src)}\b",
+                            lambda _m, _d=dst: _d,
+                            text,
+                            flags=re.IGNORECASE,
+                        )
+                # То же, но ключ — raw regex (для брендов, что коверкаются
+                # множеством способов). Битый regex логируем и пропускаем.
+                replacements_regex = cfg.get("replacements_regex") or {}
+                if isinstance(replacements_regex, dict):
+                    for pat, dst in replacements_regex.items():
+                        if not pat or not isinstance(pat, str) or not isinstance(dst, str):
+                            continue
+                        try:
+                            text = re.sub(
+                                pat,
+                                lambda _m, _d=dst: _d,
+                                text,
+                                flags=re.IGNORECASE,
+                            )
+                        except re.error as e:
+                            logging.warning(f"bad replacements_regex {pat!r}: {e}")
+                # Вырезаем известные whisper-галлюцинации (титры/кредиты).
+                # Битый паттерн логируем и пропускаем — диктовка важнее.
+                hall_patterns = cfg.get("hallucination_patterns") or []
+                if isinstance(hall_patterns, list) and hall_patterns:
+                    for pat in hall_patterns:
+                        if not pat or not isinstance(pat, str):
+                            continue
+                        try:
+                            text = re.sub(pat, "", text, flags=re.IGNORECASE)
+                        except re.error as e:
+                            logging.warning(f"bad hallucination_pattern {pat!r}: {e}")
+                    # схлопнуть двойные пробелы (но не трогать \n) и снять
+                    # повисшие пробелы по краям после вырезания
+                    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+                    # если после вычистки остались только пробелы/пунктуация —
+                    # это была чистая галлюцинация на тишине, отдаём пусто
+                    if text and not re.search(r"\w", text):
+                        text = ""
                 elapsed = time.time() - t0
 
                 if not text:
                     print("⏭  Empty transcription")
                 else:
-                    print(f"✓ ({elapsed:.1f}s) → {text}")
+                    # Опция privacy: если log_transcribed_text=false, не палим текст
+                    # в лог — только длину и время. Текст всё равно ушёл в clipboard
+                    # и вставился, просто не оседает на диске. Для случаев когда
+                    # диктуешь пароли/ключи/чувствительное.
+                    if cfg.get("log_transcribed_text", True):
+                        print(f"✓ ({elapsed:.1f}s) → {text}")
+                    else:
+                        print(f"✓ ({elapsed:.1f}s) → [{len(text)} chars, hidden]")
                     # Если предыдущая диктовка была недавно — начинаем
                     # новую с переноса строки. Порог 30s — «продолжаем
                     # в то же место»; после большой паузы вставка чистая.
@@ -1058,6 +1343,244 @@ def main_loop(cfg: dict, cfg_path: Path):
         else:
             start_recording()
 
+    def _watchdog():
+        # Если pynput потерял on_release event, is_recording=True зависает
+        # навсегда. Watchdog отбрасывает аудио и сбрасывает state — НЕ пытается
+        # транскрибировать и вставить (иначе случайный 90-сек залип = минута
+        # звука вставлена куда попало в случайное активное поле, плохой UX).
+        #
+        # Race-safety: state-мутация атомарно внутри state_lock, чтобы listener
+        # thread (stop_and_transcribe) не вошёл в свою обработку одновременно.
+        # recorder.stop() вынесен наружу lock'а — он сам потокобезопасен через
+        # внутренний _recording-флаг (двойной вызов вернёт None).
+        while True:
+            time.sleep(_WATCHDOG_TICK_SECONDS)
+
+            # Атомарно: проверь + захвати ответственность за cleanup
+            with state_lock:
+                if not state.is_recording or state.record_started_at <= 0:
+                    continue
+                elapsed = time.time() - state.record_started_at
+                if elapsed <= _MAX_RECORDING_SECONDS:
+                    continue
+                # Мы первые — listener thread теперь не войдёт в stop_and_transcribe
+                state.is_recording = False
+                state.record_started_at = 0.0
+
+            logging.warning(
+                f"watchdog: stuck recording {elapsed:.0f}s — discarding audio, "
+                f"state reset (pynput on_release event likely lost)"
+            )
+            print(
+                f"⚠️  Watchdog: запись зависла на {elapsed:.0f}с — "
+                f"аудио отброшено, готов к новому хоткею."
+            )
+
+            try:
+                wav_path = recorder.stop()
+                if wav_path:
+                    try: os.unlink(wav_path)
+                    except: pass
+            except Exception as e:
+                logging.error(f"watchdog recorder.stop failed: {e}")
+
+            tray.set_state("idle")
+            if cursor_ind:
+                try: cursor_ind.hide()
+                except: pass
+            if cfg.get("play_sound"):
+                threading.Thread(target=play_stop_beep, daemon=True).start()
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+    # ── Tap-revival watchdog (macOS CGEventTap auto-revive) ────────────────
+    # pynput на macOS не обрабатывает kCGEventTapDisabledByTimeout /
+    # kCGEventTapDisabledByUserInput — когда система отключает event tap
+    # (callback задержался, sleep/wake, и т.п.), pynput не переподнимает его
+    # и хоткей перестаёт работать до restart процесса. Чиним поллингом
+    # CGEventTapIsEnabled из отдельного потока: если disabled →
+    # CGEventTapEnable(True). Tap оживает мгновенно, без перезапуска демона.
+    # Заодно: если запись была активна в момент смерти tap'а (on_release
+    # потерялся → микрофон висит), сбрасываем state и закрываем стрим
+    # сразу, не дожидаясь _MAX_RECORDING_SECONDS обычного watchdog'а.
+    def _patch_pynput_for_tap_capture():
+        """Монкипатч pynput чтобы созданный CGEventTap сохранялся на listener._cg_tap.
+        КРИТИЧНО: должен применяться ДО создания Listener — иначе Listener.start()
+        в своём потоке вызовет ORIGINAL _create_event_tap, и tap-reference никогда
+        не появится. Идемпотентно: повторные вызовы — no-op."""
+        if platform.system() != "Darwin":
+            return False
+        try:
+            import pynput._util.darwin as _pd_util
+        except Exception as e:
+            logging.warning(f"tap revival: pynput unavailable ({e}), skipping")
+            return False
+        if getattr(_pd_util.ListenerMixin, "_cg_tap_exposed", False):
+            return True
+        _orig_create = _pd_util.ListenerMixin._create_event_tap
+
+        def _create_with_capture(self):
+            tap = _orig_create(self)
+            try:
+                self._cg_tap = tap
+            except Exception:
+                pass
+            return tap
+
+        _pd_util.ListenerMixin._create_event_tap = _create_with_capture
+        _pd_util.ListenerMixin._cg_tap_exposed = True
+        return True
+
+    def _install_tap_revival(listener, currently_pressed_ref=None):
+        if platform.system() != "Darwin":
+            return
+        try:
+            from Quartz import CGEventTapIsEnabled, CGEventTapEnable
+        except Exception as e:
+            logging.warning(f"tap revival: Quartz unavailable ({e}), skipping")
+            return
+
+        def _emergency_cleanup_if_recording():
+            with state_lock:
+                if not state.is_recording:
+                    return
+                elapsed = (
+                    time.time() - state.record_started_at
+                    if state.record_started_at > 0 else 0.0
+                )
+                state.is_recording = False
+                state.record_started_at = 0.0
+            logging.warning(
+                f"tap revival: recording active ({elapsed:.1f}s) at tap-death — "
+                f"on_release lost, discarding audio"
+            )
+            print(
+                f"⚠️  Запись сброшена ({elapsed:.1f}с) — release потерялся при "
+                f"отвале tap'а."
+            )
+            if currently_pressed_ref is not None:
+                currently_pressed_ref.clear()
+            try:
+                wav_path = recorder.stop()
+                if wav_path:
+                    try: os.unlink(wav_path)
+                    except Exception: pass
+            except Exception as e:
+                logging.error(f"emergency recorder.stop failed: {e}")
+            try: tray.set_state("idle")
+            except Exception: pass
+            if cursor_ind:
+                try: cursor_ind.hide()
+                except Exception: pass
+            if cfg.get("play_sound"):
+                threading.Thread(target=play_stop_beep, daemon=True).start()
+
+        def _revival_loop():
+            deadline = time.time() + 10.0
+            tap = None
+            while time.time() < deadline:
+                tap = getattr(listener, "_cg_tap", None)
+                if tap is not None:
+                    break
+                time.sleep(0.1)
+            if tap is None:
+                logging.warning(
+                    "tap revival: tap not exposed within 10s, giving up"
+                )
+                print("⚠️  Tap revival watchdog НЕ поднялся (monkeypatch race?)")
+                return
+
+            # WARNING-уровень (не INFO), иначе невидимо в launchd-запуске
+            # без --verbose. Один раз за процесс — шума ноль.
+            logging.warning(
+                f"tap revival: armed (poll every {_TAP_REVIVAL_TICK_SECONDS}s)"
+            )
+            print(f"🛡  Tap revival watchdog armed (poll {_TAP_REVIVAL_TICK_SECONDS}s)")
+
+            revivals = 0
+            consecutive_revivals = 0  # подряд без healthy tick → триггер self-restart
+            error_streak = 0
+            last_log_at = 0.0  # rate-limit чтобы не спамить если tap "не лечится"
+
+            while getattr(listener, "running", True):
+                time.sleep(_TAP_REVIVAL_TICK_SECONDS)
+                try:
+                    if CGEventTapIsEnabled(tap):
+                        error_streak = 0
+                        consecutive_revivals = 0
+                        continue
+                    CGEventTapEnable(tap, True)
+                    revivals += 1
+                    consecutive_revivals += 1
+                    _emergency_cleanup_if_recording()
+                    now = time.time()
+                    # Первые 5 revival'ов — лог как обычно. Дальше — раз в 30с,
+                    # с подсказкой про restart.sh: если tap "лечится" десятки
+                    # раз — значит ссылка stale (CGEventTapEnable silent no-op).
+                    if revivals <= 5:
+                        logging.warning(
+                            f"tap revival: CGEventTap was disabled — "
+                            f"re-enabled (#{revivals}) "
+                            f"[load1m={os.getloadavg()[0]:.1f}]"
+                        )
+                        print(
+                            f"♻️  Tap revived (#{revivals}) — hotkey работает дальше."
+                        )
+                        last_log_at = now
+                    elif (now - last_log_at) >= 30.0:
+                        logging.error(
+                            f"tap revival: tap keeps dying ({revivals}× total, "
+                            f"{consecutive_revivals} consecutive) — "
+                            f"tap reference likely stale"
+                        )
+                        print(
+                            f"⚠️  Tap revived {revivals}× за сессию "
+                            f"({consecutive_revivals} подряд)"
+                        )
+                        last_log_at = now
+
+                    # Stale-tap self-restart: re-enable не помогает, ссылка мёртвая.
+                    # Умираем — launchd KeepAlive поднимет новый процесс с новым tap.
+                    if consecutive_revivals >= _TAP_STALE_RESTART_THRESHOLD:
+                        logging.error(
+                            f"tap revival: {consecutive_revivals} consecutive "
+                            f"failed revivals — self-restarting via launchd KeepAlive "
+                            f"[load1m={os.getloadavg()[0]:.1f}]"
+                        )
+                        print(
+                            f"🔄 Tap zombie ({consecutive_revivals} попыток "
+                            f"подряд) — рестартую процесс через launchd…"
+                        )
+                        # Flush чтобы лог не потерялся при hard exit
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        for _h in logging.root.handlers:
+                            try: _h.flush()
+                            except Exception: pass
+                        # launchd по KeepAlive=true в com.whisper.dictation.plist
+                        # перезапустит нас автоматически за ~1 секунду
+                        os._exit(75)  # EX_TEMPFAIL
+                except Exception as e:
+                    error_streak += 1
+                    now = time.time()
+                    # Exponential backoff: 2,4,8,16,32,60s.
+                    # Лог первые 3 ошибки, дальше раз в 60с — против log-storm
+                    # если CGEventTap*-вызовы кидают перманентно.
+                    if error_streak <= 3 or (now - last_log_at) >= 60.0:
+                        logging.error(
+                            f"tap revival loop error #{error_streak}: {e}"
+                        )
+                        last_log_at = now
+                    time.sleep(min(60.0, 2.0 ** min(error_streak, 6)))
+
+        threading.Thread(target=_revival_loop, daemon=True).start()
+
+    # ВАЖНО: монкипатч pynput надо применить ДО `with keyboard.Listener(...)`,
+    # иначе Listener.start() успеет вызвать original _create_event_tap в своём
+    # потоке и tap-reference никогда не сохранится. Это race condition, который
+    # делал watchdog бесполезным в первой версии патча.
+    _patch_pynput_for_tap_capture()
+
     hotkey_str = cfg["hotkey"]
     print(f"🎤 Whisper Voice Dictation активна")
     print(f"   Хоткей: {hotkey_str} ({cfg['mode']})")
@@ -1083,6 +1606,7 @@ def main_loop(cfg: dict, cfg_path: Path):
             currently_pressed.discard(ck)
 
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            _install_tap_revival(listener, currently_pressed)
             try:
                 listener.join()
             except KeyboardInterrupt:
@@ -1090,6 +1614,7 @@ def main_loop(cfg: dict, cfg_path: Path):
     else:
         # Toggle: нажал → старт, нажал ещё раз → стоп
         with keyboard.GlobalHotKeys({hotkey_str: toggle}) as listener:
+            _install_tap_revival(listener, None)
             try:
                 listener.join()
             except KeyboardInterrupt:
@@ -1146,11 +1671,20 @@ def _attach_log_file(log_path: str, verbose: bool) -> None:
     try:
         if os.path.getsize(expanded) > _LOG_ROTATE_BYTES:
             backup = expanded + ".old"
-            try: os.replace(expanded, backup)
+            try:
+                os.replace(expanded, backup)
+                # Rotated backup тоже tightened — иначе ./dictation.log.old
+                # копит транскрипции на 644 пока не будет вручную удалён.
+                try: os.chmod(backup, 0o600)
+                except OSError: pass
             except OSError: pass
     except OSError:
         pass
     fh = open(expanded, "a", buffering=1, encoding="utf-8", errors="replace")
+    # Privacy: лог содержит plaintext транскрипции голоса. Закрываем чтение
+    # для group/other (default 644 → 600). Идемпотентно при каждом старте.
+    try: os.chmod(expanded, 0o600)
+    except OSError: pass
     sys.stdout = fh
     sys.stderr = fh
     logging.basicConfig(
