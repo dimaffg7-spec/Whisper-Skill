@@ -94,6 +94,11 @@ DEFAULT_CONFIG = {
     # как единственный feedback. Если хочешь tray на Mac на свой страх и риск —
     # поставь false (тогда show_tray/show_cursor_indicator будут уважаться).
     "mac_low_cpu_mode": True,
+    # macOS: слушать PTT-хоткей опросом состояния клавиш (33×/с) вместо
+    # CGEventTap. Tap система отключает под нагрузкой → терялся release,
+    # диктовки пропадали. Опрос отключить нельзя — «залипание» невозможно
+    # by design. false = старый событийный слушатель (pynput).
+    "mac_poll_listener": True,
     # Whisper repetition-loops: модель иногда залипает и гонит один токен/фразу
     # десятки-сотни раз («Greek Greek Greek…»). Профилактика — ниже
     # (condition_on_previous_text), а это страховка-постобработка. Два порога:
@@ -1042,6 +1047,161 @@ _TAP_REVIVAL_TICK_SECONDS = 0.5
 # (оно лечится revival без рестарта), но вдвое+ сокращает мёртвую зону хоткея.
 _TAP_STALE_RESTART_THRESHOLD = 8
 
+# ── Release-поллер: физическое состояние клавиш (macOS) ─────────────────────
+# pynput на macOS периодически теряет on_release (34 инцидента в dictation.log
+# за июнь–июль 2026: запись висла 90с, watchdog выбрасывал всё надиктованное).
+# Поллер раз в 0.2с сверяет is_recording с ФИЗИЧЕСКИМ состоянием клавиш через
+# CGEventSourceFlagsState/KeyState — этот опрос не зависит от CGEventTap и
+# работает даже когда tap мёртв. Запись идёт, а хоткей отпущен → это
+# потерянный release → штатный stop_and_transcribe (текст сохраняется).
+_RELEASE_POLL_TICK_SECONDS = 0.2
+# Грейс от старта записи: HID-state обновляется раньше доставки событий, но
+# зазор снимает любые старт-гонки. Записи короче min_duration_ms (800ms у
+# текущего конфига) всё равно отбрасываются — потерь грейс не создаёт.
+_RELEASE_POLL_GRACE_SECONDS = 0.3
+
+_MAC_MODIFIER_FLAG_MASKS = {
+    # kCGEventFlagMask* (Quartz CGEventTypes.h); ключи — канон _canonical_key
+    "ctrl": 0x00040000,   # kCGEventFlagMaskControl
+    "shift": 0x00020000,  # kCGEventFlagMaskShift
+    "alt": 0x00080000,    # kCGEventFlagMaskAlternate
+    "cmd": 0x00100000,    # kCGEventFlagMaskCommand
+}
+# kVK_* (Carbon Events.h) для не-модификаторов, которые могут быть в хоткее.
+# Буквы/цифры не мапим (layout-зависимы) — с ними поллер честно молчит.
+_MAC_KEYCODES = {
+    "space": 49, "tab": 48, "esc": 53, "caps_lock": 57,
+    "f13": 105, "f14": 107, "f15": 113, "f16": 106,
+    "f17": 64, "f18": 79, "f19": 80, "f20": 90,
+}
+
+
+def _mac_hotkey_physically_down(keys: set) -> Optional[bool]:
+    """Физически ли зажат весь хоткей прямо сейчас.
+
+    False — хотя бы одна ПРОВЕРЯЕМАЯ клавиша отпущена (можно смело стопить).
+    True — все клавиши известны и зажаты.
+    None — достоверно проверить нельзя (не macOS, Quartz недоступен, или все
+    зажаты, но в хоткее есть незнакомая клавиша) → вызывающий молчит,
+    поведение деградирует к событийному (как до фикса)."""
+    if platform.system() != "Darwin":
+        return None
+    try:
+        from Quartz import (
+            CGEventSourceFlagsState,
+            CGEventSourceKeyState,
+            kCGEventSourceStateHIDSystemState,
+        )
+    except Exception:
+        return None
+    try:
+        flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState)
+        unknown = False
+        for k in keys:
+            mask = _MAC_MODIFIER_FLAG_MASKS.get(k)
+            if mask is not None:
+                if not (flags & mask):
+                    return False
+                continue
+            code = _MAC_KEYCODES.get(k)
+            if code is None:
+                unknown = True
+                continue
+            if not CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, code):
+                return False
+        return None if unknown else True
+    except Exception:
+        return None
+
+
+# ── Poll-слушатель (macOS): PTT вообще без event tap ────────────────────────
+# Корневая причина всех «залипаний» — событийная архитектура: CGEventTap
+# macOS отключает под нагрузкой (kCGEventTapDisabledByTimeout), события
+# теряются, и никакие revival/watchdog это до конца не лечат — они лишь
+# уменьшают урон. Poll-слушатель убирает сам класс проблемы: никакого
+# перехвата, просто опрос «зажат ли хоткей» 33 раза в секунду через
+# CGEventSourceFlagsState/KeyState + edge detection. Опрос нельзя
+# «отключить», он не зависит от load и не теряет события — событий нет.
+# Поведение 1:1 со старым PTT (старт при любом нажатии Ctrl, короткие
+# записи режет min_duration_ms). Подход портируем (Windows:
+# GetAsyncKeyState), но включаем только на Darwin — там и болело.
+#
+# Адаптивный тик: в простое опрашиваем редко (фоновая цена ~втрое ниже,
+# замер 2026-07-17: 33×/с ≈ 1.4% одного ядра, 10×/с ≈ 0.5%), при зажатом
+# хоткее — часто, чтобы отпускание ловилось мгновенно. Старт-лаг до 100мс
+# безвреден: юзер начинает говорить после старт-бипа, а бип играет после
+# фактического старта записи.
+_POLL_LISTENER_TICK_SECONDS = 0.03        # хоткей зажат: отзывчивый стоп
+_POLL_LISTENER_IDLE_TICK_SECONDS = 0.1    # простой: 10×/с хватает для старта
+
+
+def _poll_ptt_loop(probe, on_down, on_up, tick: float = _POLL_LISTENER_TICK_SECONDS,
+                   idle_tick: Optional[float] = None):
+    """Цикл PTT-слушателя: probe() → True (хоткей зажат) / False / None
+    (тик пропустить). Фронт вверх → on_down(), фронт вниз → on_up().
+    Однопоточно (старт/стоп решает один поток — гонки исключены).
+    Блокирует навсегда, как listener.join(); KeyboardInterrupt наружу.
+    Ошибка тика логируется и не убивает слушатель.
+    idle_tick — интервал, пока хоткей не зажат (None = как tick)."""
+    prev_down = False
+    error_streak = 0
+    while True:
+        time.sleep(tick if prev_down else (idle_tick or tick))
+        try:
+            down = probe()
+            error_streak = 0
+            if down is None:
+                continue
+            if down and not prev_down:
+                on_down()
+            elif prev_down and not down:
+                on_up()
+            prev_down = down
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            error_streak += 1
+            logging.error(f"poll listener tick failed (#{error_streak}): {e!r}")
+            # Перманентно сломанный опрос = глухой демон, висящий «живым» —
+            # ровно тот класс тихих смертей, ради которого poll-слушатель и
+            # писался. Не терпим: после серии подряд — self-exit, launchd
+            # (KeepAlive) поднимет свежий процесс, а его probe-проверка на
+            # старте сама уведёт на событийный fallback, если опрос мёртв.
+            if error_streak >= 30:
+                logging.error(
+                    "poll listener: probe permanently failing — self-restart "
+                    "via launchd KeepAlive"
+                )
+                sys.stdout.flush(); sys.stderr.flush()
+                os._exit(75)  # EX_TEMPFAIL, как у tap revival
+            time.sleep(1.0)  # backoff — не спамим лог, edge повторится
+
+
+def _rescue_wav(wav_path: str) -> Optional[str]:
+    """Спасти WAV зависшей записи вместо удаления.
+
+    Watchdog раньше делал unlink — минута речи пропадала безвозвратно.
+    Теперь кладём в ~/.config/whisper-skill/rescued/ (0600, как остальные
+    приватные файлы) и держим последние 20 штук. Возвращает новый путь
+    или None (тогда файл удалён как раньше)."""
+    try:
+        from datetime import datetime
+        rescue_dir = Path.home() / ".config" / "whisper-skill" / "rescued"
+        rescue_dir.mkdir(parents=True, exist_ok=True)
+        dst = rescue_dir / f"rescued-{datetime.now():%Y%m%d-%H%M%S}.wav"
+        os.replace(wav_path, dst)
+        try: os.chmod(dst, 0o600)
+        except OSError: pass
+        for old in sorted(rescue_dir.glob("rescued-*.wav"))[:-20]:
+            try: old.unlink()
+            except OSError: pass
+        return str(dst)
+    except Exception as e:
+        logging.error(f"rescue wav failed: {e}")
+        try: os.unlink(wav_path)
+        except Exception: pass
+        return None
+
 
 def main_loop(cfg: dict, cfg_path: Path):
     from pynput import keyboard
@@ -1368,19 +1528,23 @@ def main_loop(cfg: dict, cfg_path: Path):
                 state.record_started_at = 0.0
 
             logging.warning(
-                f"watchdog: stuck recording {elapsed:.0f}s — discarding audio, "
+                f"watchdog: stuck recording {elapsed:.0f}s — rescuing audio, "
                 f"state reset (pynput on_release event likely lost)"
             )
             print(
                 f"⚠️  Watchdog: запись зависла на {elapsed:.0f}с — "
-                f"аудио отброшено, готов к новому хоткею."
+                f"стейт сброшен, готов к новому хоткею."
             )
 
             try:
                 wav_path = recorder.stop()
                 if wav_path:
-                    try: os.unlink(wav_path)
-                    except: pass
+                    # Не вставляем никуда (см. комментарий выше), но и не
+                    # удаляем: текст достаётся вручную через
+                    # `python -m examples.transcribe_one <файл>`.
+                    rescued = _rescue_wav(wav_path)
+                    if rescued:
+                        print(f"💾 Аудио спасено: {rescued}")
             except Exception as e:
                 logging.error(f"watchdog recorder.stop failed: {e}")
 
@@ -1431,7 +1595,7 @@ def main_loop(cfg: dict, cfg_path: Path):
         _pd_util.ListenerMixin._cg_tap_exposed = True
         return True
 
-    def _install_tap_revival(listener, currently_pressed_ref=None):
+    def _install_tap_revival(listener, currently_pressed_ref=None, keys_needed_ref=None):
         if platform.system() != "Darwin":
             return
         try:
@@ -1441,6 +1605,31 @@ def main_loop(cfg: dict, cfg_path: Path):
             return
 
         def _emergency_cleanup_if_recording():
+            # Раньше здесь запись выбрасывалась БЕЗУСЛОВНО — и мигание tap'а
+            # посреди длинной диктовки стоило всего надиктованного, хотя юзер
+            # ещё держал хоткей и продолжал говорить. Теперь сверяемся с
+            # физическим состоянием клавиш (не зависит от tap'а):
+            if keys_needed_ref:
+                phys = _mac_hotkey_physically_down(keys_needed_ref)
+                if phys is True:
+                    # Хоткей реально зажат → юзер диктует. Tap только что
+                    # реанимирован (release придёт), а потеряется — release-
+                    # поллер закроет запись штатно. Не трогаем.
+                    logging.warning(
+                        "tap revival: recording active at tap-death, hotkey "
+                        "still physically held — keeping recording alive"
+                    )
+                    return
+                if phys is False:
+                    # Уже отпустил → release-поллер остановит и ТРАНСКРИБИРУЕТ
+                    # (тик 0.2с). Не дублируем стоп и не выбрасываем аудио.
+                    logging.warning(
+                        "tap revival: recording active at tap-death, hotkey "
+                        "released — deferring to release poller"
+                    )
+                    return
+                # phys is None — физическая проверка недоступна: старое
+                # поведение ниже (сброс с отбросом аудио) как fallback.
             with state_lock:
                 if not state.is_recording:
                     return
@@ -1575,12 +1764,6 @@ def main_loop(cfg: dict, cfg_path: Path):
 
         threading.Thread(target=_revival_loop, daemon=True).start()
 
-    # ВАЖНО: монкипатч pynput надо применить ДО `with keyboard.Listener(...)`,
-    # иначе Listener.start() успеет вызвать original _create_event_tap в своём
-    # потоке и tap-reference никогда не сохранится. Это race condition, который
-    # делал watchdog бесполезным в первой версии патча.
-    _patch_pynput_for_tap_capture()
-
     hotkey_str = cfg["hotkey"]
     print(f"🎤 Whisper Voice Dictation активна")
     print(f"   Хоткей: {hotkey_str} ({cfg['mode']})")
@@ -1590,9 +1773,46 @@ def main_loop(cfg: dict, cfg_path: Path):
 
     if cfg["mode"] == "ptt":
         # Push-to-talk: нажал → запись, отпустил → транскрибировать
-        # У pynput GlobalHotKeys работает по нажатию. Для PTT отслеживаем сами через Listener.
         keys_needed = _parse_hotkey(hotkey_str)
         currently_pressed = set()
+
+        # Дефолтный путь на macOS — poll-слушатель (см. _poll_ptt_loop:
+        # никакого event tap → нечему отваливаться и терять release).
+        # mac_poll_listener: false в конфиге вернёт событийный путь ниже —
+        # откат одной строкой, без правки кода. Probe-проверка: если хоткей
+        # не опрашиваем (незнакомая клавиша), честно падаем в события.
+        use_poll_listener = (
+            platform.system() == "Darwin"
+            and cfg.get("mac_poll_listener", True)
+            and _mac_hotkey_physically_down(keys_needed) is not None
+        )
+        if use_poll_listener:
+            logging.warning(
+                f"poll listener: armed (active {_POLL_LISTENER_TICK_SECONDS * 1000:.0f}ms / "
+                f"idle {_POLL_LISTENER_IDLE_TICK_SECONDS * 1000:.0f}ms) "
+                f"— event tap не используется, revival/monkeypatch не нужны"
+            )
+            print(
+                f"🛡  Poll-слушатель: опрос {1 / _POLL_LISTENER_IDLE_TICK_SECONDS:.0f}×/с в простое, "
+                f"{1 / _POLL_LISTENER_TICK_SECONDS:.0f}×/с при зажатом хоткее, без event tap"
+            )
+            try:
+                _poll_ptt_loop(
+                    probe=lambda: _mac_hotkey_physically_down(keys_needed),
+                    on_down=start_recording,
+                    on_up=stop_and_transcribe,
+                    idle_tick=_POLL_LISTENER_IDLE_TICK_SECONDS,
+                )
+            except KeyboardInterrupt:
+                pass
+            print("\n👋 Bye")
+            return 0
+
+        # ── Событийный путь (fallback: не-Mac / mac_poll_listener=false) ──
+        # ВАЖНО: монкипатч pynput надо применить ДО `with keyboard.Listener(...)`,
+        # иначе Listener.start() успеет вызвать original _create_event_tap в
+        # своём потоке и tap-reference никогда не сохранится.
+        _patch_pynput_for_tap_capture()
 
         def on_press(key):
             currently_pressed.add(_canonical_key(key))
@@ -1605,14 +1825,65 @@ def main_loop(cfg: dict, cfg_path: Path):
                 stop_and_transcribe()
             currently_pressed.discard(ck)
 
+        # ── Release-поллер: страховка от потерянного on_release ────────
+        # Независимый от CGEventTap источник правды: опрос физического
+        # состояния клавиш. Запись активна, хоткей физически отпущен →
+        # release потерялся → останавливаем и транскрибируем как обычно.
+        # Это главный фикс «залипшего Ctrl»: раньше запись висела 90с и
+        # watchdog выбрасывал весь надиктованный текст.
+        def _release_poller():
+            # Smoke-probe: если проверка недоступна (нет Quartz / незнакомые
+            # клавиши в хоткее) — честно выключаемся, работаем как раньше.
+            # Хоткей сейчас не зажат → probe вернёт False; None = недоступно.
+            if _mac_hotkey_physically_down(keys_needed) is None:
+                logging.warning(
+                    "release poller: physical key-state check unavailable "
+                    "for this hotkey — poller disabled (events only)"
+                )
+                return
+            logging.warning(
+                f"release poller: armed (poll every {_RELEASE_POLL_TICK_SECONDS}s)"
+            )
+            print(f"🛡  Release poller armed (poll {_RELEASE_POLL_TICK_SECONDS}s)")
+            while True:
+                time.sleep(_RELEASE_POLL_TICK_SECONDS)
+                with state_lock:
+                    recording = state.is_recording
+                    started_at = state.record_started_at
+                if not recording or started_at <= 0:
+                    continue
+                if (time.time() - started_at) < _RELEASE_POLL_GRACE_SECONDS:
+                    continue
+                if _mac_hotkey_physically_down(keys_needed) is not False:
+                    continue  # зажат (True) или неопределимо (None) — молчим
+                elapsed = time.time() - started_at
+                logging.warning(
+                    f"release poller: hotkey physically released but recording "
+                    f"still active ({elapsed:.1f}s) — on_release lost, "
+                    f"stopping + transcribing"
+                )
+                print(
+                    f"♻️  Release-поллер: хоткей отпущен ({elapsed:.1f}с) — "
+                    f"останавливаю и транскрибирую."
+                )
+                # Фантомные «зажатые» клавиши мешали бы следующему on_press
+                currently_pressed.clear()
+                # Идемпотентно: если штатный on_release успел первым,
+                # внутренний guard выйдет по not is_recording.
+                stop_and_transcribe()
+
+        threading.Thread(target=_release_poller, daemon=True).start()
+
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            _install_tap_revival(listener, currently_pressed)
+            _install_tap_revival(listener, currently_pressed, keys_needed)
             try:
                 listener.join()
             except KeyboardInterrupt:
                 pass
     else:
         # Toggle: нажал → старт, нажал ещё раз → стоп
+        # Монкипатч до создания listener'а — см. комментарий в ptt-ветке.
+        _patch_pynput_for_tap_capture()
         with keyboard.GlobalHotKeys({hotkey_str: toggle}) as listener:
             _install_tap_revival(listener, None)
             try:
