@@ -1036,6 +1036,10 @@ class State:
 # drops on_release events, leaving is_recording=True forever).
 _MAX_RECORDING_SECONDS = 90.0
 _WATCHDOG_TICK_SECONDS = 3.0
+# На poll-пути залип обрывает сам poll-цикл на _MAX_RECORDING_SECONDS (штатный
+# стоп+транскрипция — речь до залипа не теряется). Watchdog ждёт ещё этот грейс
+# и служит последним рубежом: событийный путь + случай, когда poll-цикл сам мёртв.
+_WATCHDOG_FALLBACK_GRACE_SECONDS = 15.0
 _TAP_REVIVAL_TICK_SECONDS = 0.5
 # Если CGEventTapEnable(True) подряд N раз не оживляет tap (каждый следующий
 # тик IsEnabled опять False) — reference stale, re-enable бесполезен. Тогда
@@ -1144,6 +1148,8 @@ def _poll_ptt_loop(probe, on_down, on_up, tick: float = _POLL_LISTENER_TICK_SECO
     Ошибка тика логируется и не убивает слушатель.
     idle_tick — интервал, пока хоткей не зажат (None = как tick)."""
     prev_down = False
+    down_since = 0.0          # time.time() фронта вверх (для таймаута залипа флага)
+    sticky_forced = False     # форс-стоп по таймауту сделан — ждём реального release
     error_streak = 0
     while True:
         time.sleep(tick if prev_down else (idle_tick or tick))
@@ -1152,10 +1158,30 @@ def _poll_ptt_loop(probe, on_down, on_up, tick: float = _POLL_LISTENER_TICK_SECO
             error_streak = 0
             if down is None:
                 continue
-            if down and not prev_down:
+            if not down:
+                # Реальное отпускание снимает sticky-блокировку старта записи
+                sticky_forced = False
+            if down and not prev_down and not sticky_forced:
                 on_down()
+                down_since = time.time()
             elif prev_down and not down:
                 on_up()
+                down_since = 0.0
+            elif (prev_down and down and down_since > 0
+                    and time.time() - down_since > _MAX_RECORDING_SECONDS):
+                # probe() держит True дольше максимума длительности записи —
+                # физический флаг залип на уровне macOS (release-грань не пришла,
+                # sticky modifier). Форсим штатный стоп+транскрипцию (полезная речь
+                # до залипа не теряется), дальше ждём реального отпускания, чтобы не
+                # перезапускать запись по всё ещё залипшему флагу.
+                logging.warning(
+                    f"poll listener: hotkey stuck down "
+                    f"{time.time() - down_since:.0f}s (> {_MAX_RECORDING_SECONDS:.0f}s) "
+                    f"— forcing stop, awaiting real release"
+                )
+                on_up()
+                down_since = 0.0
+                sticky_forced = True
             prev_down = down
         except KeyboardInterrupt:
             raise
@@ -1514,46 +1540,52 @@ def main_loop(cfg: dict, cfg_path: Path):
         # recorder.stop() вынесен наружу lock'а — он сам потокобезопасен через
         # внутренний _recording-флаг (двойной вызов вернёт None).
         while True:
-            time.sleep(_WATCHDOG_TICK_SECONDS)
-
-            # Атомарно: проверь + захвати ответственность за cleanup
-            with state_lock:
-                if not state.is_recording or state.record_started_at <= 0:
-                    continue
-                elapsed = time.time() - state.record_started_at
-                if elapsed <= _MAX_RECORDING_SECONDS:
-                    continue
-                # Мы первые — listener thread теперь не войдёт в stop_and_transcribe
-                state.is_recording = False
-                state.record_started_at = 0.0
-
-            logging.warning(
-                f"watchdog: stuck recording {elapsed:.0f}s — rescuing audio, "
-                f"state reset (pynput on_release event likely lost)"
-            )
-            print(
-                f"⚠️  Watchdog: запись зависла на {elapsed:.0f}с — "
-                f"стейт сброшен, готов к новому хоткею."
-            )
-
             try:
-                wav_path = recorder.stop()
-                if wav_path:
-                    # Не вставляем никуда (см. комментарий выше), но и не
-                    # удаляем: текст достаётся вручную через
-                    # `python -m examples.transcribe_one <файл>`.
-                    rescued = _rescue_wav(wav_path)
-                    if rescued:
-                        print(f"💾 Аудио спасено: {rescued}")
-            except Exception as e:
-                logging.error(f"watchdog recorder.stop failed: {e}")
+                time.sleep(_WATCHDOG_TICK_SECONDS)
 
-            tray.set_state("idle")
-            if cursor_ind:
-                try: cursor_ind.hide()
-                except: pass
-            if cfg.get("play_sound"):
-                threading.Thread(target=play_stop_beep, daemon=True).start()
+                # Атомарно: проверь + захвати ответственность за cleanup
+                with state_lock:
+                    if not state.is_recording or state.record_started_at <= 0:
+                        continue
+                    elapsed = time.time() - state.record_started_at
+                    if elapsed <= _MAX_RECORDING_SECONDS + _WATCHDOG_FALLBACK_GRACE_SECONDS:
+                        continue
+                    # Мы первые — listener thread теперь не войдёт в stop_and_transcribe
+                    state.is_recording = False
+                    state.record_started_at = 0.0
+
+                logging.warning(
+                    f"watchdog: stuck recording {elapsed:.0f}s — rescuing audio, "
+                    f"state reset (pynput on_release event likely lost)"
+                )
+                print(
+                    f"⚠️  Watchdog: запись зависла на {elapsed:.0f}с — "
+                    f"стейт сброшен, готов к новому хоткею."
+                )
+
+                try:
+                    wav_path = recorder.stop()
+                    if wav_path:
+                        # Не вставляем никуда (см. комментарий выше), но и не
+                        # удаляем: текст достаётся вручную через
+                        # `python -m examples.transcribe_one <файл>`.
+                        rescued = _rescue_wav(wav_path)
+                        if rescued:
+                            print(f"💾 Аудио спасено: {rescued}")
+                except Exception as e:
+                    logging.error(f"watchdog recorder.stop failed: {e}")
+
+                tray.set_state("idle")
+                if cursor_ind:
+                    try: cursor_ind.hide()
+                    except: pass
+                if cfg.get("play_sound"):
+                    threading.Thread(target=play_stop_beep, daemon=True).start()
+            except Exception as e:
+                # Никогда не даём страховке молча умереть от разового сбоя —
+                # иначе зависшая запись висит до ручного перезапуска демона
+                # (ровно тот инцидент, ради которого это пишется).
+                logging.error(f"watchdog loop iteration failed (continuing): {e!r}")
 
     threading.Thread(target=_watchdog, daemon=True).start()
 
