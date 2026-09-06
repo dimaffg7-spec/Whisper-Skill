@@ -67,6 +67,9 @@ DEFAULT_CONFIG = {
     # это whisper initial_prompt: модель видит контекст «эти слова ожидаемы» и
     # с большей вероятностью распознаёт их правильно (особенно имена, бренды,
     # англицизмы при русской дорожке). Лимит ~244 токенов суммарно.
+    # Подхватывать ли после старта речь, не доехавшую до прошлого рестарта
+    # (конфликт за микрофон). Текст кладётся в буфер, не вставляется сам.
+    "rescue_backlog_on_start": True,
     "vocabulary": [],
     # Post-process find/replace для случаев когда vocabulary-bias не сработал
     # (whisper стабильно выдаёт неправильный вариант). Применяется к итоговому
@@ -345,6 +348,99 @@ def setup_wizard():
 # ─── Audio recording ────────────────────────────────────────────────────────
 
 
+# ── Deadlock-защита: сначала речь, потом железо (2026-09-06) ───────────────
+# Симптом, ради которого переписано: stream.stop()/close() виснет в CoreAudio
+# HALB_Mutex, когда микрофон в этот момент держит другой аудио-клиент. Раньше
+# демон в этой точке делал os._exit СРАЗУ — надиктованное оседало .wav-файлом в
+# rescued/ и до пользователя не доходило НИКОГДА (117 таких файлов с июля 2026 —
+# столько диктовок было съедено молча, при формально «работающей» страховке).
+# Теперь порядок обратный: кадры уже в памяти → пишем wav, транскрибируем,
+# вставляем, и только потом hard-exit ради освобождения микрофона.
+
+# Раньше здесь был busy-пробник (опрос state.is_transcribing). Опрос давал
+# мёртвую зону: если обработка успевала закончиться до того, как reaper начнёт
+# смотреть, тот честно ждал ещё 15с «начала работы» — всё это время микрофон
+# занят зависшим потоком, а хоткей отвечает отказом. Заменено на явный сигнал
+# recorder.speech_delivered, который ставит сам обработчик диктовки.
+
+
+def _notify_macos(title: str, text: str) -> None:
+    """Best-effort баннер. Не ждём и не падаем — диктовка важнее уведомления."""
+    if platform.system() != "Darwin":
+        return
+    try:
+        safe_text = text.replace('"', "'")[:180]
+        safe_title = title.replace('"', "'")[:80]
+        subprocess.Popen(
+            ["osascript", "-e",
+             f'display notification "{safe_text}" with title "{safe_title}"'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        logging.info(f"notify failed (non-fatal): {e}")
+
+
+# Кандидаты в «держатели микрофона». Точного API «кто сейчас держит вход» без
+# entitlement нет (kAudioHardwarePropertyProcessObjectList отдаёт 'who?' —
+# проверено 06.09.2026), поэтому копим косвенные улики: за неделю логов
+# виновник вылезет статистикой, а не догадкой.
+_AUDIO_SUSPECTS = (
+    "Comet", "Genspark", "zoom.us", "Telegram", "WisprFlow", "Wispr Flow",
+    "MacWhisper", "Discord", "Slack", "Google Chrome", "Arc", "Safari",
+    "obs", "Loom", "Krisp", "Teams", "Cyclop", "Fathom", "Claude", "Perplexity",
+)
+
+
+def _mic_conflict_snapshot() -> str:
+    """Снимок улик в момент конфликта: фронтовое приложение + запущенные
+    аудио-клиенты. Всё с таймаутами: снимок не имеет права задержать спасение
+    речи ни на секунду."""
+    front = "?"
+    try:
+        front = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to get name of first process '
+             'whose frontmost is true'],
+            capture_output=True, text=True, timeout=1.5,
+        ).stdout.strip() or "?"
+    except Exception:
+        pass
+    running = []
+    try:
+        ps_out = subprocess.run(
+            ["ps", "-axco", "command"], capture_output=True, text=True, timeout=1.5
+        ).stdout
+        # Точное совпадение имени процесса, не подстрока: "obs" внутри чужого
+        # имени превращает улику в шум, а шумная улика хуже отсутствующей.
+        names = {line.strip().lower() for line in ps_out.splitlines() if line.strip()}
+        running = [name for name in _AUDIO_SUSPECTS if name.lower() in names]
+    except Exception:
+        pass
+    return f"front={front!r} audio_apps={running}"
+
+
+def _hard_exit_after_speech_delivered(reason: str, delivered: threading.Event) -> None:
+    """Отложенный hard-exit: ждём сигнала «диктовка доехала до поля» и только
+    потом убиваем процесс — ОС освободит залоченный микрофон, launchd поднимет
+    свежий демон. Мгновенный exit (как было до 06.09.2026) гарантированно съедал
+    надиктованное. Потолок ожидания — чтобы залипшая обработка не отменила
+    перезапуск совсем: микрофон дороже одной диктовки."""
+    if not delivered.wait(timeout=_DEADLOCK_MAX_WORK_SECONDS):
+        logging.error(
+            f"обработка не отчиталась за {_DEADLOCK_MAX_WORK_SECONDS:.0f}с — "
+            "перезапускаюсь без неё"
+        )
+    time.sleep(_DEADLOCK_POST_PASTE_GRACE_SECONDS)  # paste + restore_clipboard
+    logging.error(f"hard exit(75) после доставки речи: {reason}")
+    print("♻️  Перезапускаю демон (микрофон держал чужой процесс) — текст уже вставлен",
+          flush=True)
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(75)
+
+
 class AudioRecorder:
     def __init__(self, sample_rate: int = 16000, channels: int = 1):
         self.sample_rate = sample_rate
@@ -352,10 +448,26 @@ class AudioRecorder:
         self._frames: list = []
         self._stream = None
         self._recording = False
+        # Взведён, пока прошлый поток не закрылся: новую запись поверх зависшего
+        # CoreAudio-мьютекса открывать нельзя — зависнет уже start(), в потоке
+        # слушателя, откуда не выбраться.
+        self.stream_stuck = threading.Event()
+        self._rescue_path: Optional[str] = None
+        self._rescue_lock = threading.Lock()
+        # Ставится обработчиком диктовки, когда текст вставлен (или когда
+        # вставлять нечего). Reaper зависшего потока ждёт именно его.
+        self.speech_delivered = threading.Event()
+        self.speech_delivered.set()
 
     def start(self) -> None:
         import sounddevice as sd
         import numpy as np
+
+        if self.stream_stuck.is_set():
+            raise RuntimeError(
+                "микрофон держит другой процесс, демон перезапускается — "
+                "повтори через пару секунд"
+            )
 
         self._frames = []
         self._recording = True
@@ -374,16 +486,62 @@ class AudioRecorder:
         self._stream.start()
 
     def stop(self) -> Optional[str]:
-        """Остановить запись и сохранить в WAV. Вернуть путь к файлу."""
+        """Остановить запись и сохранить в WAV. Вернуть путь к файлу.
+
+        Порядок «речь → железо» (переписано 2026-09-06). Кадры уже лежат в
+        памяти, поэтому wav пишется и возвращается СРАЗУ, а зависшее закрытие
+        потока разгребает фоновый reaper. До этого было наоборот: close() в
+        критическом пути → при зависании мгновенный os._exit → диктовка
+        потеряна (117 потерянных .wav в rescued/ за июль-сентябрь).
+        """
         import numpy as np
         import soundfile as sf
 
         if not self._recording or not self._stream:
             return None
         self._recording = False
-        self._stream.stop()
-        self._stream.close()
+        stream = self._stream
         self._stream = None
+
+        # stream.stop()/close() виснет НАВСЕГДА в CoreAudio HALB_Mutex::Lock,
+        # если микрофон в этот момент держит другой аудио-клиент (второй
+        # диктофон Wispr Flow, браузеры Comet/Genspark, Telegram, Zoom) —
+        # подтверждено sample'ом зависшего демона 2026-07-19. Дедлок в нативном
+        # мьютексе, залоченном ДРУГИМ процессом, изнутри Python не разорвать:
+        # любая страховка зовёт тот же аудио-API и виснет рядом. Поэтому
+        # закрываем в жертвенном потоке, а сами идём отдавать текст.
+        closed = threading.Event()
+
+        def _close_stream():
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as e:
+                logging.error(f"stream stop/close failed: {e!r}")
+            finally:
+                closed.set()
+
+        threading.Thread(target=_close_stream, daemon=True, name="stream-closer").start()
+
+        # В норме закрытие — миллисекунды. Короткий грейс нужен, чтобы в
+        # здоровом случае микрофонный индикатор гас до бипа, как раньше.
+        if not closed.wait(timeout=_STREAM_CLOSE_FAST_GRACE_SECONDS):
+            self.stream_stuck.set()
+            logging.error(
+                "recorder.stop: CoreAudio deadlock — микрофон держит другой "
+                f"процесс; речь спасаю и отдаю в транскрипцию; "
+                f"{_mic_conflict_snapshot()}"
+            )
+            print(
+                "⚠️  Микрофон держит другой процесс — дотранскрибирую и перезапущусь",
+                flush=True,
+            )
+            self._write_rescue_copy(np, sf)
+            self.speech_delivered.clear()
+            threading.Thread(
+                target=self._stuck_stream_reaper, args=(closed,),
+                daemon=True, name="stream-reaper",
+            ).start()
 
         if not self._frames:
             return None
@@ -394,6 +552,59 @@ class AudioRecorder:
         )
         sf.write(tmp.name, audio, self.sample_rate, subtype="PCM_16")
         return tmp.name
+
+    def _write_rescue_copy(self, np, sf) -> None:
+        """Страховочная копия речи на диск — на случай, если процесс умрёт
+        раньше вставки. Удаляется сразу после обработки (см. stop_and_transcribe),
+        так что всё, что осталось лежать в rescued/, — реально не доехавшее."""
+        try:
+            if not self._frames:
+                return
+            audio = np.concatenate(self._frames, axis=0)
+            rescue_dir = os.path.expanduser("~/.config/whisper-skill/rescued")
+            os.makedirs(rescue_dir, exist_ok=True)
+            rescue = os.path.join(
+                rescue_dir, time.strftime("deadlock_%Y%m%d_%H%M%S.wav")
+            )
+            sf.write(rescue, audio, self.sample_rate, subtype="PCM_16")
+            try:
+                os.chmod(rescue, 0o600)  # приватность: это расшифровываемая речь
+            except Exception:
+                pass
+            with self._rescue_lock:
+                self._rescue_path = rescue
+            logging.error(f"stop deadlock — страховочная копия речи в {rescue}")
+        except Exception as e:
+            logging.error(f"deadlock rescue failed: {e!r}")
+
+    def take_rescue_path(self) -> Optional[str]:
+        """Забрать и обнулить путь страховочной копии (atomic get+clear)."""
+        with self._rescue_lock:
+            path, self._rescue_path = self._rescue_path, None
+            return path
+
+    def _stuck_stream_reaper(self, closed: threading.Event) -> None:
+        """Досматривает зависшее закрытие потока. Закрылось с задержкой —
+        живём дальше без рестарта. Не закрылось — перезапуск, но только после
+        того, как речь доехала до поля."""
+        remaining = max(
+            0.0, _STREAM_CLOSE_DEADLINE_SECONDS - _STREAM_CLOSE_FAST_GRACE_SECONDS
+        )
+        if closed.wait(timeout=remaining):
+            self.stream_stuck.clear()
+            logging.warning(
+                "stream закрылся с задержкой — это были тормоза, не дедлок; "
+                "перезапуск не нужен"
+            )
+            return
+        _notify_macos(
+            "Диктовка: перезапуск",
+            "Микрофон держал другой процесс. Текст вставлен, демон поднимется сам.",
+        )
+        _hard_exit_after_speech_delivered(
+            "аудиопоток не закрылся — микрофон держит чужой процесс",
+            self.speech_delivered,
+        )
 
     @property
     def duration_sec(self) -> float:
@@ -1023,6 +1234,80 @@ def _warmup(transcribe_fn, cfg: dict, tray) -> None:
         logging.info(f"warmup failed (non-fatal): {e}")
 
 
+def _process_rescue_backlog(transcribe_fn, cfg: dict) -> None:
+    """После перезапуска из-за конфликта за микрофон подхватить спасённую речь:
+    расшифровать, положить текст в буфер и сказать об этом баннером.
+
+    Автоматически НЕ вставляем: за секунды рестарта фокус мог уехать в другое
+    окно, а вставлять чужой текст куда попало хуже, чем один раз нажать ⌘V.
+    Второй рубеж обороны — основной путь (stop → транскрипция → вставка → exit)
+    покрывает случай штатно; сюда попадает только то, что не доехало.
+    """
+    try:
+        rescue_dir = Path.home() / ".config" / "whisper-skill" / "rescued"
+        if not rescue_dir.is_dir():
+            return
+        now = time.time()
+        fresh = [
+            p for p in rescue_dir.glob("*.wav")
+            if now - p.stat().st_mtime <= _RESCUE_BACKLOG_MAX_AGE_SECONDS
+        ]
+        if not fresh:
+            return
+        fresh.sort(key=lambda p: p.stat().st_mtime)
+        fresh = fresh[-_RESCUE_BACKLOG_MAX_FILES:]
+
+        texts = []
+        for wav in fresh:
+            try:
+                result = transcribe_fn(
+                    str(wav),
+                    language=cfg.get("language"),
+                    model_name=cfg.get("model"),
+                    backend=cfg.get("backend"),
+                    word_timestamps=False,
+                    verbose=False,
+                    condition_on_previous_text=cfg.get(
+                        "condition_on_previous_text", False
+                    ),
+                )
+                text = (result.text or "").strip()
+            except Exception as e:
+                logging.error(f"rescue backlog: {wav.name} не расшифрован: {e!r}")
+                continue
+            if not text:
+                try: wav.unlink()
+                except Exception: pass
+                continue
+            texts.append(text)
+            side = wav.with_suffix(".txt")
+            try:
+                side.write_text(text, encoding="utf-8")
+                os.chmod(side, 0o600)
+            except Exception as e:
+                logging.error(f"rescue backlog: не записал {side.name}: {e!r}")
+            try: wav.unlink()
+            except Exception: pass
+
+        if not texts:
+            return
+        joined = "\n".join(texts)
+        copy_to_clipboard(joined)
+        preview = joined[:60].replace("\n", " ")
+        print(
+            f"💾 Спасено из прерванной диктовки ({len(joined)} симв.) — "
+            f"лежит в буфере, вставь ⌘V: {preview}…",
+            flush=True,
+        )
+        logging.warning(
+            f"rescue backlog: восстановлено {len(texts)} диктовок "
+            f"({len(joined)} символов) → буфер обмена"
+        )
+        _notify_macos("Речь восстановлена", f"{len(joined)} символов в буфере — вставь ⌘V")
+    except Exception as e:
+        logging.error(f"rescue backlog failed (non-fatal): {e!r}")
+
+
 @dataclass
 class State:
     is_recording: bool = False
@@ -1040,6 +1325,31 @@ _WATCHDOG_TICK_SECONDS = 3.0
 # стоп+транскрипция — речь до залипа не теряется). Watchdog ждёт ещё этот грейс
 # и служит последним рубежом: событийный путь + случай, когда poll-цикл сам мёртв.
 _WATCHDOG_FALLBACK_GRACE_SECONDS = 15.0
+# Дедлайн на закрытие аудиопотока в recorder.stop(). В норме stream.stop()/close()
+# отрабатывает за миллисекунды. Но если микрофон одновременно держит другой
+# аудио-клиент (второй диктофон Wispr Flow, браузеры Comet/Genspark, Telegram),
+# закрытие виснет НАВСЕГДА в CoreAudio HALB_Mutex::Lock (подтверждено sample'ом
+# зависшего процесса 2026-07-19). Дедлок в нативном мьютексе, залоченном другим
+# ПРОЦЕССОМ, изнутри не разорвать никакими Python-страховками — они сами зовут
+# тот же аудио-API и виснут рядом. Единственный надёжный выход — hard-exit и
+# перезапуск процесса силами launchd (см. Recorder.stop). 5с — с запасом ×1000
+# над нормой, чтобы не бить по здоровому закрытию.
+_STREAM_CLOSE_DEADLINE_SECONDS = 5.0
+# Короткий грейс в критическом пути stop(): столько ждём штатного закрытия,
+# прежде чем признать конфликт и уйти спасать речь. В норме закрытие занимает
+# миллисекунды, так что 1.5с ничего не тормозит, но микрофонный индикатор в
+# здоровом случае успевает погаснуть до бипа.
+_STREAM_CLOSE_FAST_GRACE_SECONDS = 1.5
+# Потолок ожидания сигнала «речь доехала» перед перезапуском: залипшая
+# обработка не должна отменять освобождение микрофона совсем.
+_DEADLOCK_MAX_WORK_SECONDS = 180.0
+# Запас после снятия is_transcribing: paste_from_clipboard + отложенное
+# восстановление буфера (restore_clipboard_deferred, delay 1.0s).
+_DEADLOCK_POST_PASTE_GRACE_SECONDS = 1.8
+# Подхват спасённой речи после перезапуска: берём только свежее (иначе после
+# любого рестарта всплывёт весь архив rescued/) и не больше пары файлов.
+_RESCUE_BACKLOG_MAX_AGE_SECONDS = 900.0
+_RESCUE_BACKLOG_MAX_FILES = 3
 _TAP_REVIVAL_TICK_SECONDS = 0.5
 # Если CGEventTapEnable(True) подряд N раз не оживляет tap (каждый следующий
 # тик IsEnabled опять False) — reference stale, re-enable бесполезен. Тогда
@@ -1244,6 +1554,7 @@ def main_loop(cfg: dict, cfg_path: Path):
     state_lock = threading.Lock()
     recorder = AudioRecorder(cfg["sample_rate"], cfg["channels"])
 
+
     # macOS low-CPU mode: pystray в фоне и Tk у нас вызывают серьёзный
     # idle-CPU на маке (наблюдалось ~90% на M-чипе). Дефолтно отключаем оба
     # GUI-feedback'а на Mac. Юзер видит CLI-stdout (Recording/Transcribing/✓).
@@ -1302,6 +1613,11 @@ def main_loop(cfg: dict, cfg_path: Path):
                 # Если warmup упал, первый transcribe сам потерпит cold start
                 # — это лучше чем deadlock.
                 warmup_done.set()
+            # Модель уже горячая — самое время досказать то, что не доехало
+            # до прошлого перезапуска (обычно ничего, файл появляется только
+            # если процесс умер прямо посреди обработки).
+            if cfg.get("rescue_backlog_on_start", True):
+                _process_rescue_backlog(transcribe, cfg)
 
         threading.Thread(target=_warmup_then_signal, daemon=True).start()
     else:
@@ -1336,6 +1652,14 @@ def main_loop(cfg: dict, cfg_path: Path):
             print("🎙  Recording... (release hotkey to transcribe)")
         except Exception as e:
             print(f"❌ Recording failed: {e}")
+            # Отказ из-за зависшего потока звучит и выглядит так же, как удачный
+            # старт (бип уже сыграл выше) — без явного сигнала пользователь
+            # наговорит минуту в пустоту. Поэтому баннер + отбойный бип.
+            if recorder.stream_stuck.is_set():
+                _notify_macos("Диктовка перезапускается",
+                              "Микрофон держал другой процесс. Повтори через пару секунд.")
+                if cfg.get("play_sound"):
+                    threading.Thread(target=play_stop_beep, daemon=True).start()
             state.is_recording = False
             tray.set_state("idle")
             if cursor_ind:
@@ -1357,9 +1681,15 @@ def main_loop(cfg: dict, cfg_path: Path):
         # winsound во время stream.close() PortAudio даёт повторное звучание
         # (наблюдалось 2026-05-01: один вызов PlaySound → два слышимых тона).
         wav_path = recorder.stop()
+        # Если stop() наткнулся на конфликт за микрофон, он оставил копию речи
+        # на диске. Обработка ниже идёт как обычно — копия нужна только на
+        # случай, если процесс умрёт раньше вставки, поэтому снимаем её сразу
+        # после обработки (в finally работы), а не держим вечно.
+        rescue_path = recorder.take_rescue_path()
         if cfg.get("play_sound"):
             threading.Thread(target=play_stop_beep, daemon=True).start()
         if not wav_path:
+            recorder.speech_delivered.set()  # отдавать нечего — reaper свободен
             tray.set_state("idle")
             if cursor_ind:
                 cursor_ind.hide()
@@ -1370,6 +1700,10 @@ def main_loop(cfg: dict, cfg_path: Path):
             print(f"⏭  Skipped (too short: {duration_ms:.0f}ms)")
             try: os.unlink(wav_path)
             except: pass
+            if rescue_path:
+                try: os.unlink(rescue_path)
+                except Exception: pass
+            recorder.speech_delivered.set()
             tray.set_state("idle")
             if cursor_ind:
                 cursor_ind.hide()
@@ -1514,6 +1848,13 @@ def main_loop(cfg: dict, cfg_path: Path):
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
             finally:
+                # Страховку снимаем ПЕРВОЙ: дальше reaper вправе убить процесс
+                # (он ждёт снятия is_transcribing), а оставленный файл всплыл бы
+                # после рестарта дублем уже вставленного текста.
+                if rescue_path:
+                    try: os.unlink(rescue_path)
+                    except Exception: pass
+                recorder.speech_delivered.set()
                 state.is_transcribing = False
                 tray.set_state("idle")
                 if cursor_ind:
@@ -1574,6 +1915,10 @@ def main_loop(cfg: dict, cfg_path: Path):
                             print(f"💾 Аудио спасено: {rescued}")
                 except Exception as e:
                     logging.error(f"watchdog recorder.stop failed: {e}")
+                finally:
+                    # watchdog не транскрибирует и не вставляет — значит ждать
+                    # его reaper'у нечего
+                    recorder.speech_delivered.set()
 
                 tray.set_state("idle")
                 if cursor_ind:
@@ -1802,6 +2147,17 @@ def main_loop(cfg: dict, cfg_path: Path):
     print(f"   Модель: {cfg['model']}")
     print(f"   Язык:   {cfg.get('language') or 'auto'}")
     print(f"\nНажми {hotkey_str} чтобы говорить. Ctrl+C чтобы выйти.\n")
+
+    # Маркер «патч в работе» — чтобы отличать живую защиту от правки, которая
+    # не доехала до LIVE-файла (грабли 2026-05-25: правился только backup).
+    # Ритуал проверки: grep -a "speech-first" ~/Library/whisper-dictation/dictation.log
+    logging.warning(
+        f"speech-first deadlock guard: armed (грейс {_STREAM_CLOSE_FAST_GRACE_SECONDS}с, "
+        f"дедлайн закрытия {_STREAM_CLOSE_DEADLINE_SECONDS}с, "
+        f"подхват спасённого: {bool(cfg.get('rescue_backlog_on_start', True))})"
+    )
+    print("🛡  Защита речи: при конфликте за микрофон диктовка сначала вставляется, "
+          "перезапуск потом", flush=True)
 
     if cfg["mode"] == "ptt":
         # Push-to-talk: нажал → запись, отпустил → транскрибировать
