@@ -1540,7 +1540,7 @@ def _rescue_wav(wav_path: str) -> Optional[str]:
 
 
 def main_loop(cfg: dict, cfg_path: Path):
-    from pynput import keyboard
+    from pynput import keyboard, mouse
 
     # Lazy-import чтобы не падать на импортов при ошибке отсутствия пакетов
     try:
@@ -2164,6 +2164,30 @@ def main_loop(cfg: dict, cfg_path: Path):
         keys_needed = _parse_hotkey(hotkey_str)
         currently_pressed = set()
 
+        # ── Режим «кнопка мыши как хоткей» (mouse_x1 / mouse_x2) ────────
+        # global click-события ловит pynput.mouse.Listener. Логика та же,
+        # что у клавиатурного ptt: press → запись, release → транскрибация.
+        # Кнопка НЕ подавляется (suppress): click доходит до приложения,
+        # например браузер при этом уходит "назад" — учти это. Revival/
+        # monkeypatch — mac-специфика, в этом пути они не нужны.
+        mouse_btn = _mouse_button_from_hotkey(hotkey_str)
+        if mouse_btn is not None:
+            def on_mouse_click(x, y, button, pressed):
+                if button != mouse_btn:
+                    return
+                if pressed:
+                    start_recording()
+                elif state.is_recording:
+                    stop_and_transcribe()
+
+            with mouse.Listener(on_click=on_mouse_click) as listener:
+                try:
+                    listener.join()
+                except KeyboardInterrupt:
+                    pass
+            print("\n👋 Bye")
+            return 0
+
         # Дефолтный путь на macOS — poll-слушатель (см. _poll_ptt_loop:
         # никакого event tap → нечему отваливаться и терять release).
         # mac_poll_listener: false в конфиге вернёт событийный путь ниже —
@@ -2271,6 +2295,19 @@ def main_loop(cfg: dict, cfg_path: Path):
     else:
         # Toggle: нажал → старт, нажал ещё раз → стоп
         # Монкипатч до создания listener'а — см. комментарий в ptt-ветке.
+        mouse_btn = _mouse_button_from_hotkey(hotkey_str)
+        if mouse_btn is not None:
+            def on_mouse_click_toggle(x, y, button, pressed):
+                if button == mouse_btn and pressed:
+                    toggle()
+
+            with mouse.Listener(on_click=on_mouse_click_toggle) as listener:
+                try:
+                    listener.join()
+                except KeyboardInterrupt:
+                    pass
+            print("\n👋 Bye")
+            return 0
         _patch_pynput_for_tap_capture()
         with keyboard.GlobalHotKeys({hotkey_str: toggle}) as listener:
             _install_tap_revival(listener, None)
@@ -2293,6 +2330,36 @@ def _parse_hotkey(s: str) -> set:
         else:
             keys.add(p)
     return keys
+
+
+def _mouse_button_from_hotkey(s: str):
+    """Разбирает хоткей-строку как кнопку мыши или возвращает None.
+
+    Поддерживает (регистронезависимо, с/без угловых скобок):
+      mouse_x1 / mouse4  → Button.x1  (XButton1: на большинстве мышей это
+                                        4-я кнопка, обычно «назад»)
+      mouse_x2 / mouse5  → Button.x2  (5-я кнопка, обычно «вперёд»)
+      mouse_middle       → Button.middle
+    """
+    if not s:
+        return None
+    name = s.strip().strip("<>").lower()
+    aliases = {
+        "mouse_x1": "x1",
+        "mouse_x2": "x2",
+        "mouse4": "x1",
+        "mouse5": "x2",
+        "mouse_middle": "middle",
+    }
+    btn = aliases.get(name)
+    if btn is None:
+        return None
+    try:
+        from pynput.mouse import Button
+    except Exception:
+        return None
+    return getattr(Button, btn)
+
 
 
 def _canonical_key(key) -> str:
